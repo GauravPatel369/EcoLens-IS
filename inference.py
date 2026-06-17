@@ -12,7 +12,6 @@ import yaml
 from einops import rearrange
 
 from functools import partial
-from prithvi_mae import PrithviMAE
 
 NO_DATA = -9999
 NO_DATA_FLOAT = 0.0001
@@ -283,19 +282,49 @@ def main(
 ):
     os.makedirs(output_dir, exist_ok=True)
 
+    # Auto-download config and checkpoint if missing
+    repo_id = "ibm-nasa-geospatial/Prithvi-EO-1.0-100M"
+    if config_path == "config.yaml" and not os.path.exists(config_path):
+        print(f"Downloading config from Hugging Face...")
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo_id=repo_id, filename="config.yaml", local_dir=".")
+
+    if checkpoint == "Prithvi_100M.pt" and not os.path.exists(checkpoint):
+        print(f"Downloading {checkpoint} from Hugging Face...")
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo_id=repo_id, filename="Prithvi_100M.pt", local_dir=".")
+
     # Get parameters --------
 
-    import json
     with open(config_path, "r") as f:
-        config = yaml.safe_load(f)['pretrained_cfg']
+        cfg = yaml.safe_load(f)
+
+    # Support both new config format (model_args & train_params) and legacy format (pretrained_cfg)
+    if 'model_args' in cfg:
+        config = cfg['model_args']
+        train_params = cfg.get('train_params', {})
+        bands = train_params.get('bands', ["B02", "B03", "B04", "B05", "B06", "B07"])
+        mean = train_params.get('data_mean', [775.2290211032589, 1080.992780391705, 1228.5855250417867, 2497.2022620507532, 2204.2139147975554, 1610.8324823273745])
+        std = train_params.get('data_std', [1281.526139861424, 1270.0297974547493, 1399.4802505642526, 1368.3446143747644, 1291.6764008585435, 1154.505683480695])
+        img_size = config.get('img_size', 224)
+        mask_ratio = mask_ratio or train_params.get('mask_ratio', 0.75)
+    elif 'pretrained_cfg' in cfg:
+        config = cfg['pretrained_cfg']
+        bands = config['bands']
+        mean = config['mean']
+        std = config['std']
+        img_size = config['img_size']
+        mask_ratio = mask_ratio or config['mask_ratio']
+    else:
+        bands = cfg.get('bands', ["B02", "B03", "B04", "B05", "B06", "B07"])
+        mean = cfg.get('mean', cfg.get('data_mean', [775.2290211032589, 1080.992780391705, 1228.5855250417867, 2497.2022620507532, 2204.2139147975554, 1610.8324823273745]))
+        std = cfg.get('std', cfg.get('data_std', [1281.526139861424, 1270.0297974547493, 1399.4802505642526, 1368.3446143747644, 1291.6764008585435, 1154.505683480695]))
+        img_size = cfg.get('img_size', 224)
+        mask_ratio = mask_ratio or cfg.get('mask_ratio', 0.75)
+        config = cfg
 
     batch_size = 1
-    bands = config['bands']
     num_frames = len(data_files)
-    mean = config['mean']
-    std = config['std']
-    img_size = config['img_size']
-    mask_ratio = mask_ratio or config['mask_ratio']
 
     print(
         f"\nTreating {len(data_files)} files as {len(data_files)} time steps from the same location\n"
@@ -325,6 +354,13 @@ def main(
         in_chans=len(bands),
     )
 
+    # Auto-download prithvi_mae.py if missing
+    if not os.path.exists("prithvi_mae.py"):
+        print("Downloading prithvi_mae.py from Hugging Face...")
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(repo_id=repo_id, filename="prithvi_mae.py", local_dir=".")
+
+    from prithvi_mae import PrithviMAE
     model = PrithviMAE(**config)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -453,13 +489,13 @@ if __name__ == "__main__":
         "--config_path",
         "-c",
         type=str,
-        default="config.json",
-        help="Path to json file containing model training parameters.",
+        default="config.yaml",
+        help="Path to YAML/JSON file containing model training parameters.",
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="Prithvi_EO_V1_100M.pt",
+        default="Prithvi_100M.pt",
         help="Path to a checkpoint file to load from.",
     )
     parser.add_argument(
