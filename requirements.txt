@@ -1,0 +1,9 @@
+pystac-client
+planetary-computer
+rasterio
+numpy
+pyyaml
+torch
+einops
+timm
+huggingface_hub

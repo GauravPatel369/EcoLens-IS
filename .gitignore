@@ -1,0 +1,35 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model checkpoints & configs (large files/downloads)
+Prithvi_100M.pt
+Prithvi_100M_config.yaml
+config.yaml
+
+# Hugging Face caches
+.cache/
+
+# Generated geospatial patches & databases
+patches/
+patches_processed/
+embeddings/
+metadata/catalog.json
+
+# Generated Dashboard
+embedding_dashboard.html
+
+# IDE / System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
