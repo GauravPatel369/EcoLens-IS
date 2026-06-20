@@ -24,8 +24,12 @@ patches_processed/
 embeddings/
 metadata/catalog.json
 
-# Generated Dashboard
+# Generated Dashboards
 embedding_dashboard.html
+retrieval_dashboard.html
+
+# Objective 2 — Retrieval Results
+results/
 
 # IDE / System files
 .vscode/

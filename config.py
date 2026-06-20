@@ -211,3 +211,11 @@ PATCHES_DIR = "patches"
 METADATA_DIR = "metadata"
 EMBEDDINGS_DIR = "embeddings"
 METADATA_CATALOG_PATH = f"{METADATA_DIR}/catalog.json"
+
+# ---------------------------------------------------------------
+# Objective 2 — Retrieval Engine Configuration
+# ---------------------------------------------------------------
+
+RESULTS_DIR = "results"
+DEFAULT_TOP_K = 10           # Default number of similar ecosystems to retrieve
+EVALUATION_K_VALUES = [1, 3, 5, 10]  # K values for Precision@K, Recall@K evaluation

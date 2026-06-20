@@ -99,3 +99,41 @@ To open and explore the searchable ecosystem database:
 - **Category Filtering:** Filter points by Forest, Wetland, Mangrove, Agri, or Urban Green.
 - **Ecosystem Search:** Select any query patch to instantly trigger a cosine-similarity nearest-neighbor search, returning similar ecological analogs across the globe ranked by score.
 
+---
+
+## 5. Objective 2 — Ecosystem Similarity Retrieval Framework
+
+These scripts build on the Phase 1 embeddings to implement a full retrieval framework.
+
+### Step 6: Retrieval Engine
+```powershell
+python 06_retrieval_engine.py
+```
+- **What it does:** Implements three similarity measures (Cosine Similarity, Euclidean Distance, k-Nearest Neighbor). For every patch, retrieves and ranks all other patches by each method. Builds an ecosystem analog database.
+- **Output:** `results/retrieval_results.json`, `results/analog_database.json`
+
+### Step 7: Retrieval Evaluation
+```powershell
+python 07_evaluate_retrieval.py
+```
+- **What it does:** Evaluates retrieval quality using standard IR metrics (Precision@K, Recall@K, mAP, MRR). Analyzes per-category performance for Forest, Wetland, Mangrove, Agricultural, and Urban Green ecosystems. Compares all three similarity methods. Produces a confusion matrix.
+- **Output:** `results/evaluation_report.json` + console-printed tables
+
+### Step 8: Retrieval Dashboard
+```powershell
+python 08_retrieval_dashboard.py
+```
+- **What it does:** Generates a standalone interactive HTML dashboard (`retrieval_dashboard.html`) with multi-method search, per-category performance charts, and a confusion matrix heatmap.
+- **Output:** `retrieval_dashboard.html`
+
+### Explore the Retrieval Dashboard
+```text
+http://localhost:8000/retrieval_dashboard.html
+```
+
+#### Retrieval Dashboard Features:
+- **Method Selector:** Switch between Cosine, Euclidean, and kNN similarity
+- **Per-Category Performance:** Bar chart comparing mAP across ecosystem types
+- **Confusion Matrix:** Heatmap showing retrieval confusion between categories
+- **Enhanced Search:** Multi-method ecosystem similarity search with ranked results
+
