@@ -1,23 +1,21 @@
 """
-EcoLens Objective 2 — Step 6: Ecosystem Similarity Retrieval Engine
+EcoLens Objective 2 - Step 6: Ecosystem Similarity Retrieval Engine
 
-Implements the core retrieval framework using three similarity measures
-specified in the project proposal:
+Implements the core retrieval framework using three similarity measures:
   - Cosine Similarity
   - Euclidean Distance (converted to similarity)
   - k-Nearest Neighbor (kNN) retrieval
 
-For each patch in the database, retrieves and ranks all other patches
-by similarity using each method. Results are saved as a structured
-JSON file and an ecosystem analog database.
-
-Prerequisites:
-    Run scripts 01–05 first to generate embeddings and catalog.
+Supports multiple foundation models via --model flag:
+  prithvi, vit, resnet
 
 Run:
-    python 06_retrieval_engine.py
+    python 06_retrieval_engine.py                # default: prithvi
+    python 06_retrieval_engine.py --model vit
+    python 06_retrieval_engine.py --model resnet
 """
 
+import argparse
 import json
 import os
 import numpy as np
@@ -25,6 +23,7 @@ import numpy as np
 from config import (
     METADATA_CATALOG_PATH, EMBEDDINGS_DIR,
     RESULTS_DIR, DEFAULT_TOP_K,
+    SUPPORTED_MODELS, DEFAULT_MODEL,
 )
 
 
@@ -205,31 +204,49 @@ class EcosystemRetrievalEngine:
 # ---------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="EcoLens Step 6: Ecosystem Similarity Retrieval Engine"
+    )
+    parser.add_argument(
+        "--model", type=str, default=DEFAULT_MODEL,
+        choices=list(SUPPORTED_MODELS.keys()),
+        help=f"Foundation model embeddings to use (default: {DEFAULT_MODEL})",
+    )
+    args = parser.parse_args()
+    model_key = args.model
+    model_cfg = SUPPORTED_MODELS[model_key]
+    emb_dir = model_cfg["embeddings_dir"]
+    label = model_cfg["label"]
+
+    print(f"\n{'='*60}")
+    print(f"EcoLens Retrieval Engine - {label}")
+    print(f"{model_cfg['description']}")
+    print(f"{'='*60}\n")
+
     # Validate prerequisites
     if not os.path.exists(METADATA_CATALOG_PATH):
         print(f"Error: Catalog not found at {METADATA_CATALOG_PATH}.")
-        print("Run scripts 01–04 first to generate embeddings and catalog.")
+        print("Run scripts 01-04 first to generate embeddings and catalog.")
         return
 
     with open(METADATA_CATALOG_PATH) as f:
         catalog = json.load(f)
 
-    # Load only entries that have embeddings
-    valid_entries = [
-        e for e in catalog
-        if "embedding_path" in e and os.path.exists(e["embedding_path"])
-    ]
+    # Load embeddings from the model-specific directory
+    valid_entries = []
+    embeddings = {}
+    for e in catalog:
+        emb_path = f"{emb_dir}/{e['id']}.npy"
+        if os.path.exists(emb_path):
+            valid_entries.append(e)
+            embeddings[e["id"]] = np.load(emb_path)
 
     if len(valid_entries) < 2:
-        print(f"Error: Need at least 2 patches with embeddings. Found {len(valid_entries)}.")
-        print("Run scripts 01–03 first.")
+        print(f"Error: Need at least 2 patches with embeddings in {emb_dir}/. Found {len(valid_entries)}.")
+        print(f"Run: python 03_extract_embeddings.py --model {model_key}")
         return
 
-    print(f"Loading {len(valid_entries)} embeddings...")
-
-    embeddings = {}
-    for entry in valid_entries:
-        embeddings[entry["id"]] = np.load(entry["embedding_path"])
+    print(f"Loaded {len(valid_entries)} embeddings from {emb_dir}/")
 
     # Initialize retrieval engine
     engine = EcosystemRetrievalEngine(valid_entries, embeddings)
@@ -256,17 +273,22 @@ def main():
             query_eco = engine.catalog[qid]["ecosystem"]
             print(f"\n  Query: {qid} ({query_eco})")
             print(f"  {'Rank':<5} {'ID':<20} {'Score':<10} {'Ecosystem':<15} {'Name'}")
-            print(f"  {'─'*5} {'─'*20} {'─'*10} {'─'*15} {'─'*30}")
+            print(f"  {'-'*5} {'-'*20} {'-'*10} {'-'*15} {'-'*30}")
             for item in top5:
-                match_tag = "✓" if item["ecosystem"] == query_eco else "✗"
+                match_tag = "[Y]" if item["ecosystem"] == query_eco else "[N]"
                 print(f"  {item['rank']:<5} {item['id']:<20} {item['score']:<10.4f} "
                       f"{item['ecosystem']:<15} {item['name'][:30]} {match_tag}")
 
-    # Save full retrieval results
-    results_path = f"{RESULTS_DIR}/retrieval_results.json"
+    # Save model-specific retrieval results
+    results_path = f"{RESULTS_DIR}/retrieval_results_{model_key}.json"
     with open(results_path, "w") as f:
         json.dump(all_results, f, indent=2)
-    print(f"\nFull retrieval results saved to: {results_path}")
+    print(f"\nRetrieval results saved to: {results_path}")
+
+    # Also save as the default file for backward compatibility
+    default_results_path = f"{RESULTS_DIR}/retrieval_results.json"
+    with open(default_results_path, "w") as f:
+        json.dump(all_results, f, indent=2)
 
     # ---------------------------------------------------------------
     # 2. Build ecosystem analog database (using cosine similarity)
@@ -275,18 +297,24 @@ def main():
     print(f"\nBuilding ecosystem analog database (top-{DEFAULT_TOP_K} per patch)...")
     analog_db = engine.build_analog_database(method="cosine", top_k=DEFAULT_TOP_K)
 
-    analog_path = f"{RESULTS_DIR}/analog_database.json"
+    analog_path = f"{RESULTS_DIR}/analog_database_{model_key}.json"
     with open(analog_path, "w") as f:
         json.dump(analog_db, f, indent=2)
     print(f"Ecosystem analog database saved to: {analog_path}")
+
+    # Also save as the default file for backward compatibility
+    default_analog_path = f"{RESULTS_DIR}/analog_database.json"
+    with open(default_analog_path, "w") as f:
+        json.dump(analog_db, f, indent=2)
 
     # ---------------------------------------------------------------
     # 3. Summary statistics
     # ---------------------------------------------------------------
 
     print(f"\n{'='*60}")
-    print("RETRIEVAL ENGINE SUMMARY")
+    print(f"RETRIEVAL ENGINE SUMMARY ({label})")
     print(f"{'='*60}")
+    print(f"  Model: {label}")
     print(f"  Total patches indexed: {len(valid_entries)}")
     print(f"  Ecosystem categories: {sorted(set(e['ecosystem'] for e in valid_entries))}")
     print(f"  Similarity methods: {EcosystemRetrievalEngine.SUPPORTED_METHODS}")
