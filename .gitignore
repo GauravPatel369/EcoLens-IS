@@ -22,6 +22,8 @@ config.yaml
 patches/
 patches_processed/
 embeddings/
+embeddings_vit/
+embeddings_resnet/
 metadata/catalog.json
 
 # Generated Dashboards

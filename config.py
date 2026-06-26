@@ -219,3 +219,37 @@ METADATA_CATALOG_PATH = f"{METADATA_DIR}/catalog.json"
 RESULTS_DIR = "results"
 DEFAULT_TOP_K = 10           # Default number of similar ecosystems to retrieve
 EVALUATION_K_VALUES = [1, 3, 5, 10]  # K values for Precision@K, Recall@K evaluation
+
+# ---------------------------------------------------------------
+# Multi-Model Comparison Configuration
+# ---------------------------------------------------------------
+
+SUPPORTED_MODELS = {
+    "prithvi": {
+        "label": "Prithvi-100M",
+        "description": "NASA/IBM Geospatial Foundation Model (6-band, 768D)",
+        "embedding_dim": 768,
+        "embeddings_dir": "embeddings",          # Original location (backward-compat)
+        "timm_name": None,                       # Not a timm model
+    },
+    "vit": {
+        "label": "ViT-Base",
+        "description": "Vision Transformer Base (ImageNet, RGB, 768D)",
+        "embedding_dim": 768,
+        "embeddings_dir": "embeddings_vit",
+        "timm_name": "vit_base_patch16_224",
+    },
+    "resnet": {
+        "label": "ResNet-50",
+        "description": "ResNet-50 (ImageNet, RGB, 2048D)",
+        "embedding_dim": 2048,
+        "embeddings_dir": "embeddings_resnet",
+        "timm_name": "resnet50",
+    },
+}
+
+DEFAULT_MODEL = "prithvi"
+
+# ImageNet normalization stats (for ViT-Base and ResNet-50)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
