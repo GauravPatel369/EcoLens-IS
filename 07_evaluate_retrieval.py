@@ -1,27 +1,23 @@
 """
-EcoLens Objective 2 — Step 7: Retrieval Performance Evaluation
+EcoLens Objective 2 - Step 7: Retrieval Performance Evaluation (Multi-Model)
 
-Systematically evaluates the retrieval engine from Step 6 using standard
-information retrieval metrics. Addresses the project proposal activities:
-  - Evaluate retrieval performance across different ecosystem types
-  - Analyze retrieval consistency for: Forest, Wetlands, Mangroves
-  - Compare retrieval quality across similarity methods
+Evaluates retrieval quality for every foundation model that has been run
+through 06_retrieval_engine.py. Automatically discovers all
+retrieval_results_<model>.json files in the results/ directory.
 
-Ground truth definition: a retrieved patch is "relevant" if it belongs
-to the same ecosystem category as the query patch.
-
-Prerequisites:
-    Run 06_retrieval_engine.py first to generate retrieval results.
+Outputs a unified cross-model comparison and saves per-model evaluations
+into a single evaluation_report.json.
 
 Run:
     python 07_evaluate_retrieval.py
 """
 
+import glob
 import json
 import os
 import numpy as np
 
-from config import RESULTS_DIR, EVALUATION_K_VALUES
+from config import RESULTS_DIR, EVALUATION_K_VALUES, SUPPORTED_MODELS
 
 
 # ---------------------------------------------------------------
@@ -248,7 +244,7 @@ def print_overall_table(evaluations):
     k_values = EVALUATION_K_VALUES
 
     print("\n" + "=" * 80)
-    print("OVERALL RETRIEVAL PERFORMANCE — Cross-Method Comparison")
+    print("OVERALL RETRIEVAL PERFORMANCE - Cross-Method Comparison")
     print("=" * 80)
 
     # Header
@@ -258,7 +254,7 @@ def print_overall_table(evaluations):
     for k in k_values:
         header += f" {'R@'+str(k):<8}"
     print(header)
-    print("─" * len(header))
+    print("-" * len(header))
 
     for method in methods:
         overall = evaluations[method]["overall"]
@@ -276,14 +272,14 @@ def print_category_table(evaluations, method):
     per_category = evaluations[method]["per_category"]
 
     print(f"\n{'='*80}")
-    print(f"PER-CATEGORY RETRIEVAL PERFORMANCE — {method.upper()}")
+    print(f"PER-CATEGORY RETRIEVAL PERFORMANCE - {method.upper()}")
     print(f"{'='*80}")
 
     header = f"{'Category':<15} {'#Q':<4} {'#Rel':<5} {'mAP':<8} {'MRR':<8}"
     for k in k_values:
         header += f" {'P@'+str(k):<8}"
     print(header)
-    print("─" * len(header))
+    print("-" * len(header))
 
     for eco in sorted(per_category.keys()):
         cat = per_category[eco]
@@ -301,16 +297,16 @@ def print_confusion_matrix(evaluations, method):
     categories = sorted(confusion.keys())
 
     print(f"\n{'='*80}")
-    print(f"RETRIEVAL CONFUSION MATRIX — {method.upper()}")
+    print(f"RETRIEVAL CONFUSION MATRIX - {method.upper()}")
     print(f"(Row = query category, Column = retrieved category, values = proportion)")
     print(f"{'='*80}")
 
     # Header
-    header = f"{'Query \\ Retr':<15}"
+    header = f"{'Query/Retr':<15}"
     for cat in categories:
         header += f" {cat[:10]:<12}"
     print(header)
-    print("─" * len(header))
+    print("-" * len(header))
 
     for query_cat in categories:
         row = f"{query_cat:<15}"
@@ -323,35 +319,17 @@ def print_confusion_matrix(evaluations, method):
         print(row)
 
 
-# ---------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------
-
-def main():
-    results_path = f"{RESULTS_DIR}/retrieval_results.json"
-
-    if not os.path.exists(results_path):
-        print(f"Error: Retrieval results not found at {results_path}.")
-        print("Run 06_retrieval_engine.py first.")
-        return
-
-    with open(results_path) as f:
-        all_results = json.load(f)
-
-    # Build catalog lookup from the retrieval results themselves
-    # Each result entry contains ecosystem, name, lon, lat metadata
+def build_catalog_lookup(all_results):
+    """Build a catalog lookup dict from the retrieval results."""
     catalog_lookup = {}
     for method_name, method_results in all_results.items():
         for query_id, results in method_results.items():
-            # Add query itself to catalog lookup
             if query_id not in catalog_lookup:
-                # Infer ecosystem from the query_id prefix
                 ecosystem = query_id.rsplit("_", 1)[0]
                 catalog_lookup[query_id] = {
                     "id": query_id,
                     "ecosystem": ecosystem,
                 }
-            # Add all result entries to catalog lookup
             for item in results:
                 if item["id"] not in catalog_lookup:
                     catalog_lookup[item["id"]] = {
@@ -361,7 +339,7 @@ def main():
                     }
         break  # Only need one method to build the lookup
 
-    # Also load catalog.json for richer metadata if available
+    # Enrich with catalog.json metadata if available
     from config import METADATA_CATALOG_PATH
     if os.path.exists(METADATA_CATALOG_PATH):
         with open(METADATA_CATALOG_PATH) as f:
@@ -372,50 +350,168 @@ def main():
             else:
                 catalog_lookup[entry["id"]].update(entry)
 
-    # ---------------------------------------------------------------
-    # Evaluate each method
-    # ---------------------------------------------------------------
+    return catalog_lookup
+
+
+def evaluate_single_model(results_path, model_key):
+    """Evaluate a single model's retrieval results and return the evaluation dict."""
+    label = SUPPORTED_MODELS.get(model_key, {}).get("label", model_key)
+
+    with open(results_path) as f:
+        all_results = json.load(f)
+
+    catalog_lookup = build_catalog_lookup(all_results)
 
     evaluations = {}
-
     for method_name, method_results in all_results.items():
-        print(f"\nEvaluating {method_name.upper()} retrieval...")
         evaluation = evaluate_method(
             method_results, catalog_lookup, method_name, EVALUATION_K_VALUES
         )
         evaluations[method_name] = evaluation
 
+    return evaluations
+
+
+def print_cross_model_table(all_model_evals):
+    """Print a comparison table across all evaluated models (using cosine mAP)."""
+    k_values = EVALUATION_K_VALUES
+
+    print(f"\n{'='*90}")
+    print("CROSS-MODEL RETRIEVAL PERFORMANCE COMPARISON (Cosine Similarity)")
+    print(f"{'='*90}")
+
+    header = f"{'Model':<20} {'mAP':<8} {'MRR':<8}"
+    for k in k_values:
+        header += f" {'P@'+str(k):<8}"
+    for k in k_values:
+        header += f" {'R@'+str(k):<8}"
+    print(header)
+    print("-" * len(header))
+
+    for model_key, evals in all_model_evals.items():
+        label = SUPPORTED_MODELS.get(model_key, {}).get("label", model_key)
+        cosine_overall = evals.get("cosine", {}).get("overall", {})
+        if not cosine_overall:
+            continue
+        row = f"{label:<20} {cosine_overall.get('mAP', 0):<8.4f} {cosine_overall.get('MRR', 0):<8.4f}"
+        for k in k_values:
+            row += f" {cosine_overall.get(f'P@{k}', 0):<8.4f}"
+        for k in k_values:
+            row += f" {cosine_overall.get(f'R@{k}', 0):<8.4f}"
+        print(row)
+
+
+def print_cross_model_category_table(all_model_evals):
+    """Print per-category mAP comparison across all models."""
+    print(f"\n{'='*90}")
+    print("PER-CATEGORY mAP COMPARISON ACROSS MODELS (Cosine Similarity)")
+    print(f"{'='*90}")
+
+    # Collect all categories
+    all_cats = set()
+    for evals in all_model_evals.values():
+        cosine_eval = evals.get("cosine", {})
+        per_cat = cosine_eval.get("per_category", {})
+        all_cats.update(per_cat.keys())
+    all_cats = sorted(all_cats)
+
+    # Header
+    header = f"{'Category':<15}"
+    for model_key in all_model_evals:
+        label = SUPPORTED_MODELS.get(model_key, {}).get("label", model_key)
+        header += f" {label:<15}"
+    print(header)
+    print("-" * len(header))
+
+    for cat in all_cats:
+        row = f"{cat:<15}"
+        for model_key, evals in all_model_evals.items():
+            cat_data = evals.get("cosine", {}).get("per_category", {}).get(cat, {})
+            map_val = cat_data.get("mAP", 0.0)
+            row += f" {map_val:<15.4f}"
+        print(row)
+
+
+# ---------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------
+
+def main():
+    # Discover all model-specific retrieval result files
+    result_files = glob.glob(f"{RESULTS_DIR}/retrieval_results_*.json")
+
+    if not result_files:
+        # Fallback: try the legacy non-model-specific file
+        legacy_path = f"{RESULTS_DIR}/retrieval_results.json"
+        if os.path.exists(legacy_path):
+            result_files = [legacy_path]
+        else:
+            print(f"Error: No retrieval result files found in {RESULTS_DIR}/.")
+            print("Run 06_retrieval_engine.py --model <model> first.")
+            return
+
+    # Parse model keys from filenames
+    model_files = {}
+    for fpath in sorted(result_files):
+        fname = os.path.basename(fpath)
+        # Extract model key from 'retrieval_results_<model>.json'
+        if fname.startswith("retrieval_results_") and fname.endswith(".json"):
+            model_key = fname.replace("retrieval_results_", "").replace(".json", "")
+            model_files[model_key] = fpath
+        elif fname == "retrieval_results.json":
+            model_files["prithvi"] = fpath
+
+    print(f"Found retrieval results for {len(model_files)} model(s): {list(model_files.keys())}")
+
+    # Evaluate each model
+    all_model_evals = {}
+
+    for model_key, fpath in model_files.items():
+        label = SUPPORTED_MODELS.get(model_key, {}).get("label", model_key)
+        print(f"\n{'='*80}")
+        print(f"Evaluating {label} ({model_key})")
+        print(f"{'='*80}")
+
+        evaluations = evaluate_single_model(fpath, model_key)
+        all_model_evals[model_key] = evaluations
+
+        # Print per-model method comparison table
+        print_overall_table(evaluations)
+
+        # Print per-category for cosine
+        if "cosine" in evaluations:
+            print_category_table(evaluations, "cosine")
+            print_confusion_matrix(evaluations, "cosine")
+
     # ---------------------------------------------------------------
-    # Print results
+    # Cross-model comparison
     # ---------------------------------------------------------------
 
-    # 1. Cross-method comparison table
-    print_overall_table(evaluations)
-
-    # 2. Per-category analysis for each method
-    for method_name in all_results.keys():
-        print_category_table(evaluations, method_name)
-
-    # 3. Confusion matrix for the best method (cosine by default)
-    print_confusion_matrix(evaluations, "cosine")
+    if len(all_model_evals) > 1:
+        print_cross_model_table(all_model_evals)
+        print_cross_model_category_table(all_model_evals)
 
     # ---------------------------------------------------------------
-    # Determine best method
+    # Summary
     # ---------------------------------------------------------------
 
     print(f"\n{'='*80}")
     print("ANALYSIS SUMMARY")
     print(f"{'='*80}")
 
-    # Find best method by mAP
-    best_method = max(evaluations.keys(), key=lambda m: evaluations[m]["overall"]["mAP"])
-    best_map = evaluations[best_method]["overall"]["mAP"]
-    print(f"\n  Best overall method by mAP: {best_method.upper()} (mAP = {best_map:.4f})")
+    # Find best model by cosine mAP
+    best_model = max(
+        all_model_evals.keys(),
+        key=lambda m: all_model_evals[m].get("cosine", {}).get("overall", {}).get("mAP", 0)
+    )
+    best_label = SUPPORTED_MODELS.get(best_model, {}).get("label", best_model)
+    best_map = all_model_evals[best_model]["cosine"]["overall"]["mAP"]
+    print(f"\n  Best model by cosine mAP: {best_label} (mAP = {best_map:.4f})")
 
-    # Per-category insights
-    print(f"\n  Per-category retrieval quality ({best_method.upper()}):")
-    per_cat = evaluations[best_method]["per_category"]
+    # Per-category insights for the best model
+    per_cat = all_model_evals[best_model]["cosine"]["per_category"]
     sorted_cats = sorted(per_cat.keys(), key=lambda c: per_cat[c]["mAP"], reverse=True)
+    print(f"\n  Per-category retrieval quality ({best_label}, Cosine):")
     for eco in sorted_cats:
         map_val = per_cat[eco]["mAP"]
         quality = "excellent" if map_val > 0.8 else "good" if map_val > 0.5 else "moderate" if map_val > 0.3 else "poor"
@@ -426,17 +522,18 @@ def main():
     avg_relevant = np.mean([per_cat[c]["num_relevant_per_query"] for c in categories])
     total_patches = sum(per_cat[c]["num_queries"] for c in categories)
     random_p5 = avg_relevant / (total_patches - 1)
-    print(f"\n  Random baseline P@5 ≈ {random_p5:.4f}")
-    print(f"  Achieved P@5 = {evaluations[best_method]['overall']['P@5']:.4f} "
-          f"({evaluations[best_method]['overall']['P@5']/random_p5:.1f}x above random)")
+    print(f"\n  Random baseline P@5 ~ {random_p5:.4f}")
+    best_p5 = all_model_evals[best_model]["cosine"]["overall"]["P@5"]
+    print(f"  Best model P@5 = {best_p5:.4f} "
+          f"({best_p5/random_p5:.1f}x above random)")
 
     # ---------------------------------------------------------------
-    # Save evaluation report
+    # Save unified evaluation report
     # ---------------------------------------------------------------
 
     report_path = f"{RESULTS_DIR}/evaluation_report.json"
     with open(report_path, "w") as f:
-        json.dump(evaluations, f, indent=2)
+        json.dump(all_model_evals, f, indent=2)
     print(f"\n  Evaluation report saved to: {report_path}")
     print(f"\nDone. Run 08_retrieval_dashboard.py next to visualize these results.")
 
