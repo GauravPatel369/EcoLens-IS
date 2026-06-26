@@ -1,15 +1,18 @@
 """
-EcoLens Objective 2 — Step 8: Retrieval Dashboard
+EcoLens Objective 2 - Step 8: Retrieval Dashboard (Multi-Model)
 
 Generates an interactive standalone HTML dashboard visualizing
 the retrieval engine results and evaluation metrics from Steps 6-7.
 
+Supports multiple foundation models with a model selector dropdown.
+
 Features:
+  - Model selector (Prithvi-100M / ViT-Base / ResNet-50)
+  - Cross-model performance comparison bar chart
   - Similarity method selector (cosine / euclidean / kNN)
   - Per-category performance bar chart
   - Confusion matrix heatmap
   - Enhanced ecosystem search with multi-method comparison
-  - Evaluation metrics summary panel
 
 Prerequisites:
     Run 06_retrieval_engine.py and 07_evaluate_retrieval.py first.
@@ -21,7 +24,10 @@ Run:
 import json
 import os
 import numpy as np
-from config import METADATA_CATALOG_PATH, EMBEDDINGS_DIR, RESULTS_DIR
+from config import (
+    METADATA_CATALOG_PATH, EMBEDDINGS_DIR, RESULTS_DIR,
+    SUPPORTED_MODELS,
+)
 
 
 def cosine_similarity(a, b):
@@ -35,13 +41,72 @@ def euclidean_similarity(a, b):
     return 1.0 / (1.0 + float(np.linalg.norm(a - b)))
 
 
-def build_html(dashboard_data, eval_data, sims_cosine, sims_euclidean, sims_knn, gap_cos, gap_euc, gap_knn):
+def compute_model_data(catalog, model_key):
+    """Compute PCA coordinates + similarity matrices for a single model."""
+    model_cfg = SUPPORTED_MODELS[model_key]
+    emb_dir = model_cfg["embeddings_dir"]
+
+    ids, vectors, valid = [], [], []
+    for entry in catalog:
+        emb_path = f"{emb_dir}/{entry['id']}.npy"
+        if os.path.exists(emb_path):
+            ids.append(entry["id"])
+            vectors.append(np.load(emb_path))
+            valid.append(entry)
+
+    if len(valid) < 2:
+        return None
+
+    X = np.stack(vectors)
+
+    # PCA projection
+    X_mean = X.mean(axis=0)
+    X_centered = X - X_mean
+    cov = np.cov(X_centered, rowvar=False)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+    idx = np.argsort(eigenvalues)[::-1]
+    X_2d = X_centered @ eigenvectors[:, idx][:, :2]
+
+    # Compute similarity matrices for all three methods
+    sims_cos, sims_euc, sims_knn = {}, {}, {}
+
+    for i, id_a in enumerate(ids):
+        sims_cos[id_a], sims_euc[id_a], sims_knn[id_a] = {}, {}, {}
+        for j, id_b in enumerate(ids):
+            cs = cosine_similarity(vectors[i], vectors[j])
+            es = euclidean_similarity(vectors[i], vectors[j])
+            sims_cos[id_a][id_b] = cs
+            sims_euc[id_a][id_b] = es
+            sims_knn[id_a][id_b] = es
+
+    dashboard_data = []
+    for i, entry in enumerate(valid):
+        dashboard_data.append({
+            "id": entry["id"], "ecosystem": entry["ecosystem"],
+            "name": entry["name"], "lon": entry["lon"], "lat": entry["lat"],
+            "protected_area": entry.get("protected_area", False),
+            "climatic_region": entry.get("climatic_region", "Unknown"),
+            "x": float(X_2d[i, 0]), "y": float(X_2d[i, 1]),
+        })
+
+    return {
+        "dashboard_data": dashboard_data,
+        "sims_cos": sims_cos,
+        "sims_euc": sims_euc,
+        "sims_knn": sims_knn,
+    }
+
+
+def build_html(all_model_data, eval_data, model_labels):
+    # Use first available model as default
+    default_model = list(all_model_data.keys())[0]
+
     return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>EcoLens: Ecosystem Similarity Retrieval Dashboard</title>
+<title>EcoLens: Multi-Model Ecosystem Retrieval Dashboard</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Plus+Jakarta+Sans:wght@300;400;600;700&display=swap" rel="stylesheet">
@@ -59,9 +124,14 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 .stat-card .label{{font-size:.7rem;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:2px}}
 .stat-card .value{{font-family:var(--tf);font-size:1.3rem;font-weight:700}}
 .stat-card.glow .value{{color:var(--green)}}
+.model-select-bar{{background:var(--panel);border:1px solid var(--border);backdrop-filter:blur(16px);border-radius:12px;padding:14px 20px;margin-bottom:25px;display:flex;align-items:center;gap:15px;flex-wrap:wrap}}
+.model-select-bar label{{font-size:.85rem;color:var(--t2);font-weight:600;text-transform:uppercase;letter-spacing:1px}}
+.model-select{{background:#141b2d;border:1px solid var(--border);color:var(--t1);padding:8px 14px;border-radius:8px;font-family:var(--ff);font-size:.9rem;cursor:pointer;outline:none;min-width:200px}}
+.model-select:focus{{border-color:var(--pri)}}
+.model-desc{{color:var(--t2);font-size:.82rem;font-style:italic}}
 .grid-main{{display:grid;grid-template-columns:1fr 380px;gap:25px;align-items:start}}
 @media(max-width:1024px){{.grid-main{{grid-template-columns:1fr}}}}
-.panel{{background:var(--panel);border:1px solid var(--border);backdrop-filter:blur(16px);border-radius:16px;padding:22px}}
+.panel{{background:var(--panel);border:1px solid var(--border);backdrop-filter:blur(16px);border-radius:16px;padding:22px;margin-bottom:25px}}
 .panel-title{{font-family:var(--tf);font-size:1.2rem;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}}
 .metrics-grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-bottom:25px}}
 .chart-box{{background:rgba(10,14,23,.4);border-radius:12px;border:1px solid rgba(255,255,255,.03);padding:15px;height:320px;position:relative}}
@@ -99,15 +169,26 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 <header>
 <div class="brand">
 <h1>EcoLens Retrieval Dashboard</h1>
-<p>Objective 2 — Ecosystem Similarity Retrieval Framework | Prithvi-100M</p>
+<p>Multi-Model Ecosystem Similarity Retrieval Framework | Prithvi-100M vs ViT-Base vs ResNet-50</p>
 </div>
 <div class="quick-stats">
-<div class="stat-card"><div class="label">Patches</div><div class="value">{len(dashboard_data)}</div></div>
-<div class="stat-card"><div class="label">Methods</div><div class="value">3</div></div>
-<div class="stat-card glow"><div class="label">mAP (Cosine)</div><div class="value">{eval_data.get('cosine', dict()).get('overall', dict()).get('mAP',0):.3f}</div></div>
-<div class="stat-card"><div class="label">MRR (Cosine)</div><div class="value">{eval_data.get('cosine', dict()).get('overall', dict()).get('MRR',0):.3f}</div></div>
+<div class="stat-card"><div class="label">Models</div><div class="value" id="stat-models">{len(all_model_data)}</div></div>
+<div class="stat-card"><div class="label">Patches</div><div class="value" id="stat-patches">--</div></div>
+<div class="stat-card glow"><div class="label">mAP (Cosine)</div><div class="value" id="stat-map">--</div></div>
+<div class="stat-card"><div class="label">MRR (Cosine)</div><div class="value" id="stat-mrr">--</div></div>
 </div>
 </header>
+
+<div class="model-select-bar">
+<label>Foundation Model:</label>
+<select id="model-select" class="model-select"></select>
+<span class="model-desc" id="model-desc"></span>
+</div>
+
+<div class="panel" id="cross-model-panel" style="display:none">
+<h2 class="panel-title">Cross-Model mAP Comparison (Cosine Similarity)</h2>
+<div class="chart-box"><canvas id="cross-model-chart"></canvas></div>
+</div>
 
 <div class="metrics-grid">
 <div class="panel">
@@ -154,60 +235,124 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 </div>
 </div>
 </div>
-<div class="footer"><p>EcoLens Objective 2 — Ecosystem Similarity Retrieval Framework | Prithvi-100M Foundation Model</p></div>
+<div class="footer"><p>EcoLens - Multi-Model Ecosystem Similarity Retrieval Framework | Prithvi-100M, ViT-Base, ResNet-50</p></div>
 </div>
 
 <script>
-const D={json.dumps(dashboard_data)};
-const E={json.dumps(eval_data)};
-const S={{cosine:{json.dumps(sims_cosine)},euclidean:{json.dumps(sims_euclidean)},knn:{json.dumps(sims_knn)}}};
+const ALL_MODEL_DATA={json.dumps(all_model_data)};
+const EVAL={json.dumps(eval_data)};
+const MODEL_LABELS={json.dumps(model_labels)};
 const colors={{'forest':'#10b981','wetland':'#3b82f6','mangrove':'#06b6d4','agricultural':'#f59e0b','urban_green':'#ec4899'}};
+const modelColors={{'prithvi':'#8b5cf6','vit':'#3b82f6','resnet':'#f59e0b'}};
+let currentModel='{default_model}';
 let currentMethod='cosine';
+let scatterChart=null;
+let catChart=null;
+let crossModelChart=null;
 
-// Populate dropdown
-const sel=document.getElementById('patch-select');
-D.forEach(d=>{{const o=document.createElement('option');o.value=d.id;o.textContent=`[${{d.ecosystem.toUpperCase()}}] ${{d.name}} (${{d.id}})`;sel.appendChild(o)}});
+// Populate model selector
+const modelSel=document.getElementById('model-select');
+Object.keys(ALL_MODEL_DATA).forEach(mk=>{{const o=document.createElement('option');o.value=mk;o.textContent=MODEL_LABELS[mk]||mk;modelSel.appendChild(o)}});
+modelSel.value=currentModel;
 
-// Scatter chart
-const ctx=document.getElementById('scatter-chart').getContext('2d');
-const scatterData={{datasets:D.map(d=>({{label:d.id,data:[{{x:d.x,y:d.y}}],backgroundColor:colors[d.ecosystem]||'#8b5cf6',pointRadius:8,pointHoverRadius:11,borderColor:'rgba(255,255,255,.4)',borderWidth:1,meta:d}}))}};
-const chart=new Chart(ctx,{{type:'scatter',data:scatterData,options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:c=>{{const m=c.dataset.meta;return[`${{m.id}}: ${{m.name}}`,`Ecosystem: ${{m.ecosystem.toUpperCase()}}`,`Climate: ${{m.climatic_region}}`]}}}}}}}},scales:{{x:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC1',color:'#94a3b8'}}}},y:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC2',color:'#94a3b8'}}}}}},onClick:(e,el)=>{{if(el.length){{const m=chart.data.datasets[el[0].datasetIndex].meta;sel.value=m.id;doSearch(m.id)}}}}}}}});
+// Cross-model chart (if multiple models)
+function buildCrossModelChart(){{
+  const panel=document.getElementById('cross-model-panel');
+  if(Object.keys(ALL_MODEL_DATA).length<2){{panel.style.display='none';return}}
+  panel.style.display='block';
+  const cats=new Set();
+  Object.keys(EVAL).forEach(mk=>{{const pc=EVAL[mk]?.cosine?.per_category||{{}};Object.keys(pc).forEach(c=>cats.add(c))}});
+  const sortedCats=[...cats].sort();
+  const datasets=Object.keys(EVAL).map(mk=>{{
+    const pc=EVAL[mk]?.cosine?.per_category||{{}};
+    return{{label:MODEL_LABELS[mk]||mk,data:sortedCats.map(c=>(pc[c]?.mAP||0)),backgroundColor:(modelColors[mk]||'#8b5cf6')+'99',borderColor:modelColors[mk]||'#8b5cf6',borderWidth:1}}
+  }});
+  const ctx=document.getElementById('cross-model-chart').getContext('2d');
+  if(crossModelChart)crossModelChart.destroy();
+  crossModelChart=new Chart(ctx,{{type:'bar',data:{{labels:sortedCats.map(c=>c.charAt(0).toUpperCase()+c.slice(1)),datasets}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{ticks:{{color:'#94a3b8'}},grid:{{color:'rgba(255,255,255,.05)'}}}},y:{{ticks:{{color:'#94a3b8'}},grid:{{color:'rgba(255,255,255,.05)'}},title:{{display:true,text:'mAP (Cosine)',color:'#94a3b8'}}}}}}}}}});
+}}
+buildCrossModelChart();
 
-// Category performance chart
-const cats=Object.keys(E.cosine?.per_category||{{}}).sort();
-const catCtx=document.getElementById('cat-chart').getContext('2d');
-new Chart(catCtx,{{type:'bar',data:{{labels:cats.map(c=>c.charAt(0).toUpperCase()+c.slice(1)),datasets:[{{label:'Cosine mAP',data:cats.map(c=>(E.cosine?.per_category?.[c]?.mAP||0)),backgroundColor:'rgba(139,92,246,.6)',borderColor:'#8b5cf6',borderWidth:1}},{{label:'Euclidean mAP',data:cats.map(c=>(E.euclidean?.per_category?.[c]?.mAP||0)),backgroundColor:'rgba(59,130,246,.6)',borderColor:'#3b82f6',borderWidth:1}},{{label:'kNN mAP',data:cats.map(c=>(E.knn?.per_category?.[c]?.mAP||0)),backgroundColor:'rgba(6,182,212,.6)',borderColor:'#06b6d4',borderWidth:1}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{ticks:{{color:'#94a3b8'}},grid:{{color:'rgba(255,255,255,.05)'}}}},y:{{ticks:{{color:'#94a3b8'}},grid:{{color:'rgba(255,255,255,.05)'}},title:{{display:true,text:'mAP',color:'#94a3b8'}}}}}}}}}});
+function switchModel(mk){{
+  currentModel=mk;
+  const md=ALL_MODEL_DATA[mk];
+  if(!md)return;
+  const D=md.dashboard_data;
+  // Update stats
+  const ev=EVAL[mk]||{{}};
+  document.getElementById('stat-patches').textContent=D.length;
+  document.getElementById('stat-map').textContent=(ev.cosine?.overall?.mAP||0).toFixed(3);
+  document.getElementById('stat-mrr').textContent=(ev.cosine?.overall?.MRR||0).toFixed(3);
+  document.getElementById('model-desc').textContent=(MODEL_LABELS[mk]||mk);
 
-// Confusion matrix
-const conf=E.cosine?.confusion_matrix||{{}};
-const confCats=Object.keys(conf).sort();
-if(confCats.length){{let h='<table class="conf-table"><tr><th>Query \\\\ Retr</th>';confCats.forEach(c=>h+=`<th>${{c.slice(0,8)}}</th>`);h+='</tr>';confCats.forEach(qc=>{{h+=`<tr><th>${{qc.slice(0,8)}}</th>`;confCats.forEach(rc=>{{const v=conf[qc]?.[rc]||0;const bg=qc===rc?`rgba(16,185,129,${{Math.min(v*1.5,.8)}})`:`rgba(236,72,153,${{Math.min(v*2,.6)}})`;h+=`<td style="background:${{bg}}">${{v.toFixed(3)}}</td>`}});h+='</tr>'}});h+='</table>';document.getElementById('conf-matrix-container').innerHTML=h}}
+  // Rebuild dropdown
+  const sel=document.getElementById('patch-select');
+  sel.innerHTML='<option value="" disabled selected>Select a patch to search...</option>';
+  D.forEach(d=>{{const o=document.createElement('option');o.value=d.id;o.textContent=`[${{d.ecosystem.toUpperCase()}}] ${{d.name}} (${{d.id}})`;sel.appendChild(o)}});
+
+  // Rebuild scatter chart
+  const ctx=document.getElementById('scatter-chart').getContext('2d');
+  if(scatterChart)scatterChart.destroy();
+  const scatterData={{datasets:D.map(d=>({{label:d.id,data:[{{x:d.x,y:d.y}}],backgroundColor:colors[d.ecosystem]||'#8b5cf6',pointRadius:8,pointHoverRadius:11,borderColor:'rgba(255,255,255,.4)',borderWidth:1,meta:d}}))}}; 
+  scatterChart=new Chart(ctx,{{type:'scatter',data:scatterData,options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:c=>{{const m=c.dataset.meta;return[`${{m.id}}: ${{m.name}}`,`Ecosystem: ${{m.ecosystem.toUpperCase()}}`,`Climate: ${{m.climatic_region}}`]}}}}}}}},scales:{{x:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC1',color:'#94a3b8'}}}},y:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC2',color:'#94a3b8'}}}}}},onClick:(e,el)=>{{if(el.length){{const m=scatterChart.data.datasets[el[0].datasetIndex].meta;sel.value=m.id;doSearch(m.id)}}}}}}}});
+
+  // Rebuild category chart
+  const cats=Object.keys(ev.cosine?.per_category||{{}}).sort();
+  const catCtx=document.getElementById('cat-chart').getContext('2d');
+  if(catChart)catChart.destroy();
+  catChart=new Chart(catCtx,{{type:'bar',data:{{labels:cats.map(c=>c.charAt(0).toUpperCase()+c.slice(1)),datasets:[{{label:'Cosine mAP',data:cats.map(c=>(ev.cosine?.per_category?.[c]?.mAP||0)),backgroundColor:'rgba(139,92,246,.6)',borderColor:'#8b5cf6',borderWidth:1}},{{label:'Euclidean mAP',data:cats.map(c=>(ev.euclidean?.per_category?.[c]?.mAP||0)),backgroundColor:'rgba(59,130,246,.6)',borderColor:'#3b82f6',borderWidth:1}},{{label:'kNN mAP',data:cats.map(c=>(ev.knn?.per_category?.[c]?.mAP||0)),backgroundColor:'rgba(6,182,212,.6)',borderColor:'#06b6d4',borderWidth:1}}]}},options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{labels:{{color:'#94a3b8',font:{{size:11}}}}}}}},scales:{{x:{{ticks:{{color:'#94a3b8'}},grid:{{color:'rgba(255,255,255,.05)'}}}},y:{{ticks:{{color:'#94a3b8'}},grid:{{color:'rgba(255,255,255,.05)'}},title:{{display:true,text:'mAP',color:'#94a3b8'}}}}}}}}}});
+
+  // Rebuild confusion matrix
+  const conf=ev.cosine?.confusion_matrix||{{}};
+  const confCats=Object.keys(conf).sort();
+  const cmContainer=document.getElementById('conf-matrix-container');
+  if(confCats.length){{let h='<table class="conf-table"><tr><th>Query/Retr</th>';confCats.forEach(c=>h+=`<th>${{c.slice(0,8)}}</th>`);h+='</tr>';confCats.forEach(qc=>{{h+=`<tr><th>${{qc.slice(0,8)}}</th>`;confCats.forEach(rc=>{{const v=conf[qc]?.[rc]||0;const bg=qc===rc?`rgba(16,185,129,${{Math.min(v*1.5,.8)}})`:`rgba(236,72,153,${{Math.min(v*2,.6)}})`;h+=`<td style="background:${{bg}}">${{v.toFixed(3)}}</td>`}});h+='</tr>'}});h+='</table>';cmContainer.innerHTML=h}}else{{cmContainer.innerHTML='<p style="color:var(--t2);text-align:center">No confusion matrix data available.</p>'}}
+
+  // Reset search
+  document.getElementById('no-sel').style.display='block';
+  document.getElementById('detail-card').style.display='none';
+  document.getElementById('sim-results').style.display='none';
+}}
+
+// Initialize with default model
+switchModel(currentModel);
+
+// Model selector change
+modelSel.addEventListener('change',e=>switchModel(e.target.value));
 
 // Method tabs
-document.querySelectorAll('.method-tab').forEach(btn=>{{btn.addEventListener('click',()=>{{document.querySelectorAll('.method-tab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentMethod=btn.dataset.method;const qid=sel.value;if(qid)doSearch(qid)}})}});
+document.querySelectorAll('.method-tab').forEach(btn=>{{btn.addEventListener('click',()=>{{document.querySelectorAll('.method-tab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentMethod=btn.dataset.method;const qid=document.getElementById('patch-select').value;if(qid)doSearch(qid)}})}});
 
-sel.addEventListener('change',e=>doSearch(e.target.value));
+document.getElementById('patch-select').addEventListener('change',e=>doSearch(e.target.value));
 
-function doSearch(qid){{const d=D.find(x=>x.id===qid);if(!d)return;
-document.getElementById('no-sel').style.display='none';
-document.getElementById('detail-card').style.display='block';
-document.getElementById('sim-results').style.display='block';
-document.getElementById('d-name').textContent=d.name;
-document.getElementById('d-id').textContent=d.id;
-document.getElementById('d-cat').textContent=d.ecosystem.toUpperCase();
-document.getElementById('d-climate').textContent=d.climatic_region;
-document.getElementById('d-prot').textContent=d.protected_area?'Protected':'Unprotected';
-document.getElementById('d-coords').textContent=`${{d.lon.toFixed(4)}}, ${{d.lat.toFixed(4)}}`;
+function doSearch(qid){{
+  const md=ALL_MODEL_DATA[currentModel];
+  if(!md)return;
+  const D=md.dashboard_data;
+  const d=D.find(x=>x.id===qid);
+  if(!d)return;
 
-const sims=S[currentMethod]?.[qid]||{{}};
-const sorted=Object.keys(sims).filter(id=>id!==qid).map(id=>({{id,score:sims[id],meta:D.find(x=>x.id===id)}})).filter(x=>x.meta).sort((a,b)=>b.score-a.score);
+  document.getElementById('no-sel').style.display='none';
+  document.getElementById('detail-card').style.display='block';
+  document.getElementById('sim-results').style.display='block';
+  document.getElementById('d-name').textContent=d.name;
+  document.getElementById('d-id').textContent=d.id;
+  document.getElementById('d-cat').textContent=d.ecosystem.toUpperCase();
+  document.getElementById('d-climate').textContent=d.climatic_region;
+  document.getElementById('d-prot').textContent=d.protected_area?'Protected':'Unprotected';
+  document.getElementById('d-coords').textContent=`${{d.lon.toFixed(4)}}, ${{d.lat.toFixed(4)}}`;
 
-const rc=document.getElementById('rankings');rc.innerHTML='';
-sorted.slice(0,15).forEach(m=>{{const div=document.createElement('div');div.className='ranking-item';div.onclick=()=>{{sel.value=m.id;doSearch(m.id)}};
-div.innerHTML=`<div><span class="ranking-name">${{m.meta.name}}</span><div class="ranking-meta"><span class="eco-badge badge-${{m.meta.ecosystem}}">${{m.meta.ecosystem}}</span><span>${{m.meta.climatic_region}}</span></div></div><span class="ranking-score">${{m.score.toFixed(4)}}</span>`;
-rc.appendChild(div)}});
+  const simKey=currentMethod==='knn'?'sims_knn':currentMethod==='euclidean'?'sims_euc':'sims_cos';
+  const sims=md[simKey]?.[qid]||{{}};
+  const sorted=Object.keys(sims).filter(id=>id!==qid).map(id=>({{id,score:sims[id],meta:D.find(x=>x.id===id)}})).filter(x=>x.meta).sort((a,b)=>b.score-a.score);
 
-chart.data.datasets.forEach(ds=>{{if(ds.label===qid){{ds.pointRadius=14;ds.borderWidth=3;ds.borderColor='#fff'}}else{{ds.pointRadius=8;ds.borderWidth=1;ds.borderColor='rgba(255,255,255,.4)'}}}});chart.update()}}
+  const rc=document.getElementById('rankings');rc.innerHTML='';
+  sorted.slice(0,15).forEach(m=>{{const div=document.createElement('div');div.className='ranking-item';div.onclick=()=>{{document.getElementById('patch-select').value=m.id;doSearch(m.id)}};
+  div.innerHTML=`<div><span class="ranking-name">${{m.meta.name}}</span><div class="ranking-meta"><span class="eco-badge badge-${{m.meta.ecosystem}}">${{m.meta.ecosystem}}</span><span>${{m.meta.climatic_region}}</span></div></div><span class="ranking-score">${{m.score.toFixed(4)}}</span>`;
+  rc.appendChild(div)}});
+
+  if(scatterChart){{scatterChart.data.datasets.forEach(ds=>{{if(ds.label===qid){{ds.pointRadius=14;ds.borderWidth=3;ds.borderColor='#fff'}}else{{ds.pointRadius=8;ds.borderWidth=1;ds.borderColor='rgba(255,255,255,.4)'}}}});scatterChart.update()}}
+}}
 </script>
 </body>
 </html>'''
@@ -221,61 +366,24 @@ def main():
     with open(METADATA_CATALOG_PATH) as f:
         catalog = json.load(f)
 
-    valid = [e for e in catalog if "embedding_path" in e and os.path.exists(e["embedding_path"])]
-    if len(valid) < 2:
-        print(f"Error: Need at least 2 patches with embeddings. Found {len(valid)}.")
+    # Compute data for each model that has embeddings
+    all_model_data = {}
+    model_labels = {}
+
+    for model_key, model_cfg in SUPPORTED_MODELS.items():
+        emb_dir = model_cfg["embeddings_dir"]
+        if not os.path.isdir(emb_dir):
+            continue
+
+        result = compute_model_data(catalog, model_key)
+        if result is not None:
+            all_model_data[model_key] = result
+            model_labels[model_key] = model_cfg["label"]
+            print(f"Loaded {model_cfg['label']}: {len(result['dashboard_data'])} patches")
+
+    if not all_model_data:
+        print("Error: No model embeddings found. Run 03_extract_embeddings.py first.")
         return
-
-    print(f"Loading {len(valid)} embeddings...")
-    ids, vectors = [], []
-    for entry in valid:
-        ids.append(entry["id"])
-        vectors.append(np.load(entry["embedding_path"]))
-    X = np.stack(vectors)
-
-    # PCA projection (same method as 05_create_database_and_dashboard.py)
-    X_mean = X.mean(axis=0)
-    X_centered = X - X_mean
-    cov = np.cov(X_centered, rowvar=False)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    idx = np.argsort(eigenvalues)[::-1]
-    X_2d = X_centered @ eigenvectors[:, idx][:, :2]
-
-    # Compute similarity matrices for all three methods
-    sims_cos, sims_euc, sims_knn = {}, {}, {}
-    same_cos, cross_cos = [], []
-    same_euc, cross_euc = [], []
-    same_knn, cross_knn = [], []
-
-    for i, id_a in enumerate(ids):
-        sims_cos[id_a], sims_euc[id_a], sims_knn[id_a] = {}, {}, {}
-        for j, id_b in enumerate(ids):
-            cs = cosine_similarity(vectors[i], vectors[j])
-            es = euclidean_similarity(vectors[i], vectors[j])
-            sims_cos[id_a][id_b] = cs
-            sims_euc[id_a][id_b] = es
-            sims_knn[id_a][id_b] = es  # kNN uses euclidean similarity for display
-            if i < j:
-                eco_a = valid[i]["ecosystem"]
-                eco_b = valid[j]["ecosystem"]
-                if eco_a == eco_b:
-                    same_cos.append(cs); same_euc.append(es)
-                else:
-                    cross_cos.append(cs); cross_euc.append(es)
-
-    gap_cos = np.mean(same_cos) - np.mean(cross_cos) if same_cos and cross_cos else 0
-    gap_euc = np.mean(same_euc) - np.mean(cross_euc) if same_euc and cross_euc else 0
-    gap_knn = gap_euc
-
-    dashboard_data = []
-    for i, entry in enumerate(valid):
-        dashboard_data.append({
-            "id": entry["id"], "ecosystem": entry["ecosystem"],
-            "name": entry["name"], "lon": entry["lon"], "lat": entry["lat"],
-            "protected_area": entry.get("protected_area", False),
-            "climatic_region": entry.get("climatic_region", "Unknown"),
-            "x": float(X_2d[i, 0]), "y": float(X_2d[i, 1]),
-        })
 
     # Load evaluation data if available
     eval_path = f"{RESULTS_DIR}/evaluation_report.json"
@@ -287,13 +395,14 @@ def main():
     else:
         print(f"Warning: {eval_path} not found. Dashboard will have empty metrics.")
 
-    html = build_html(dashboard_data, eval_data, sims_cos, sims_euc, sims_knn, gap_cos, gap_euc, gap_knn)
+    html = build_html(all_model_data, eval_data, model_labels)
 
     out_path = "retrieval_dashboard.html"
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 
     print(f"\nRetrieval dashboard saved to: {out_path}")
+    print(f"Models included: {list(model_labels.values())}")
     print("Open in a browser to explore ecosystem similarity retrieval results.")
 
 
