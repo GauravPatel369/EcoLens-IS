@@ -1,38 +1,35 @@
 """
-EcoLens Phase 1 -- Step 3: Model inference
+EcoLens Phase 1 -- Step 3: Model inference (Multi-Model)
 
-Loads Prithvi-100M and runs it on every preprocessed patch to extract
-a single embedding vector per patch. This is the core foundation-model
-step that turns raw imagery into the representations EcoLens compares
-in Phase 2/3.
+Extracts embedding vectors from ecosystem patches using one of several
+foundation models:
+  - prithvi  : NASA/IBM Prithvi-100M (6-band geospatial ViT, 768D)
+  - vit      : ViT-Base (ImageNet RGB, 768D)  via timm
+  - resnet   : ResNet-50 (ImageNet RGB, 2048D) via timm
 
-IMPORTANT INPUT SHAPE NOTE:
-Prithvi-100M is a *temporal* ViT -- it expects input shaped
-(batch, channels, time, height, width), i.e. 5 dimensions, even for a
-single timestep. A static patch needs an extra T=1 dimension inserted,
-or the model's patch embedding layer will throw a shape mismatch.
-The encoder output for a 224x224 patch is (1, 197, 768) for the CLS
-token + 196 patch tokens at 768-dim (Prithvi-100M base config) --
-double check this against your specific config.yaml model_args.
-
-Prerequisites (one-time setup):
-    pip install torch einops timm huggingface_hub pyyaml --break-system-packages
-    git clone https://github.com/NASA-IMPACT/hls-foundation-os.git
-    # download Prithvi_100M.pt and Prithvi_100M_config.yaml from:
-    # https://huggingface.co/ibm-nasa-geospatial/Prithvi-100M
-    # place both files in this directory, and add hls-foundation-os to PYTHONPATH
+The Prithvi-100M pathway uses the full 6-band preprocessed patches.
+ViT-Base and ResNet-50 use only the RGB bands from the *raw* patches
+(indices 2=Red, 1=Green, 0=Blue), rescaled to [0,1] and normalized
+with ImageNet statistics.
 
 Run:
-    python 03_extract_embeddings.py
+    python 03_extract_embeddings.py                # default: prithvi
+    python 03_extract_embeddings.py --model vit
+    python 03_extract_embeddings.py --model resnet
 """
 
+import argparse
 import json
 import os
 import numpy as np
+import timm
 import torch
 import yaml
 
-from config import PATCHES_DIR, METADATA_CATALOG_PATH, EMBEDDINGS_DIR
+from config import (
+    PATCHES_DIR, METADATA_CATALOG_PATH, EMBEDDINGS_DIR,
+    SUPPORTED_MODELS, DEFAULT_MODEL, IMAGENET_MEAN, IMAGENET_STD,
+)
 
 PRITHVI_CHECKPOINT_PATH = "Prithvi_100M.pt"
 PRITHVI_CONFIG_PATH = "Prithvi_100M_config.yaml"
@@ -116,25 +113,77 @@ def extract_embedding(model, patch_tensor):
     return pooled.squeeze(0).cpu().numpy()
 
 
-def main():
-    os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
+# ---------------------------------------------------------------
+# Generic timm model helpers (ViT-Base, ResNet-50)
+# ---------------------------------------------------------------
+
+def load_timm_model(model_name):
+    """
+    Load a pretrained timm model in feature-extraction mode.
+    Returns the model moved to DEVICE in eval mode.
+    """
+    model = timm.create_model(model_name, pretrained=True, num_classes=0)
+    model.eval()
+    model.to(DEVICE)
+    return model
+
+
+def prepare_rgb_tensor(raw_patch):
+    """
+    Prepare a 3-channel (RGB) tensor from a raw 6-band Sentinel-2 patch.
+
+    Band order in our raw patches (from config.PRITHVI_BANDS):
+        0=Blue, 1=Green, 2=Red, 3=NIR, 4=SWIR1, 5=SWIR2
+
+    We select R, G, B (indices 2, 1, 0), rescale from raw DN [0, 10000]
+    to [0, 1], then apply ImageNet normalization.
+    """
+    # Extract RGB bands in R, G, B order
+    rgb = raw_patch[[2, 1, 0], :, :]  # shape: (3, 224, 224)
+    # Clip and rescale to [0, 1]
+    rgb = np.clip(rgb, 0, 10000).astype(np.float32) / 10000.0
+
+    # Normalize with ImageNet stats
+    mean = np.array(IMAGENET_MEAN, dtype=np.float32)[:, None, None]
+    std = np.array(IMAGENET_STD, dtype=np.float32)[:, None, None]
+    rgb = (rgb - mean) / std
+
+    return torch.from_numpy(rgb).float()
+
+
+@torch.no_grad()
+def extract_timm_embedding(model, rgb_tensor):
+    """
+    Run a timm model on a single RGB patch and return the pooled embedding.
+
+    timm models with num_classes=0 return the pooled feature vector directly.
+    """
+    x = rgb_tensor.unsqueeze(0).to(DEVICE)  # (1, 3, 224, 224)
+    features = model(x)                     # (1, embed_dim)
+    return features.squeeze(0).cpu().numpy()
+
+
+# ---------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------
+
+def run_prithvi(catalog):
+    """Extract embeddings using the Prithvi-100M geospatial model."""
+    emb_dir = SUPPORTED_MODELS["prithvi"]["embeddings_dir"]
+    os.makedirs(emb_dir, exist_ok=True)
 
     print(f"Loading Prithvi-100M on device: {DEVICE}")
     model = load_prithvi_model()
     print("Model loaded.")
 
-    with open(METADATA_CATALOG_PATH) as f:
-        catalog = json.load(f)
-
     updated_catalog = []
-
     for entry in catalog:
         if "processed_path" not in entry:
             print(f"[{entry['id']}] No processed patch found -- run "
                   f"02_preprocess_patches.py first. Skipping.")
             continue
 
-        out_path = f"{EMBEDDINGS_DIR}/{entry['id']}.npy"
+        out_path = f"{emb_dir}/{entry['id']}.npy"
         if "embedding_path" in entry and os.path.exists(out_path):
             print(f"[{entry['id']}] Embedding already exists. Skipping inference.")
             updated_catalog.append(entry)
@@ -158,10 +207,80 @@ def main():
         print(f"[{entry['id']}] embedding shape={embedding.shape}, "
               f"norm={np.linalg.norm(embedding):.3f}")
 
-    with open(METADATA_CATALOG_PATH, "w") as f:
-        json.dump(updated_catalog, f, indent=2)
+    return updated_catalog
 
-    print(f"\nExtracted embeddings for {len(updated_catalog)} patches.")
+
+def run_timm_model(catalog, model_key):
+    """Extract embeddings using a timm model (ViT-Base or ResNet-50)."""
+    model_cfg = SUPPORTED_MODELS[model_key]
+    emb_dir = model_cfg["embeddings_dir"]
+    timm_name = model_cfg["timm_name"]
+    label = model_cfg["label"]
+    os.makedirs(emb_dir, exist_ok=True)
+
+    print(f"Loading {label} ({timm_name}) on device: {DEVICE}")
+    model = load_timm_model(timm_name)
+    print("Model loaded.")
+
+    count = 0
+    for entry in catalog:
+        patch_path = entry.get("patch_path")
+        if not patch_path or not os.path.exists(patch_path):
+            print(f"[{entry['id']}] No raw patch found. Skipping.")
+            continue
+
+        out_path = f"{emb_dir}/{entry['id']}.npy"
+        if os.path.exists(out_path):
+            print(f"[{entry['id']}] Embedding already exists. Skipping.")
+            count += 1
+            continue
+
+        raw_patch = np.load(patch_path)
+        rgb_tensor = prepare_rgb_tensor(raw_patch)
+
+        try:
+            embedding = extract_timm_embedding(model, rgb_tensor)
+        except Exception as e:
+            print(f"[{entry['id']}] Inference failed: {e}")
+            continue
+
+        np.save(out_path, embedding)
+        count += 1
+
+        print(f"[{entry['id']}] embedding shape={embedding.shape}, "
+              f"norm={np.linalg.norm(embedding):.3f}")
+
+    print(f"\n{label}: Extracted/cached embeddings for {count} patches in {emb_dir}/")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="EcoLens Step 3: Extract ecosystem embeddings"
+    )
+    parser.add_argument(
+        "--model", type=str, default=DEFAULT_MODEL,
+        choices=list(SUPPORTED_MODELS.keys()),
+        help=f"Foundation model to use (default: {DEFAULT_MODEL})",
+    )
+    args = parser.parse_args()
+    model_key = args.model
+
+    print(f"\n{'='*60}")
+    print(f"EcoLens Embedding Extraction - {SUPPORTED_MODELS[model_key]['label']}")
+    print(f"{SUPPORTED_MODELS[model_key]['description']}")
+    print(f"{'='*60}\n")
+
+    with open(METADATA_CATALOG_PATH) as f:
+        catalog = json.load(f)
+
+    if model_key == "prithvi":
+        updated_catalog = run_prithvi(catalog)
+        # Update the catalog file only for prithvi (backward compat)
+        with open(METADATA_CATALOG_PATH, "w") as f:
+            json.dump(updated_catalog, f, indent=2)
+        print(f"\nExtracted embeddings for {len(updated_catalog)} patches.")
+    else:
+        run_timm_model(catalog, model_key)
 
 
 if __name__ == "__main__":
