@@ -97,7 +97,7 @@ def compute_model_data(catalog, model_key):
     }
 
 
-def build_html(all_model_data, eval_data, model_labels):
+def build_html(all_model_data, eval_data, explain_data, model_labels):
     # Use first available model as default
     default_model = list(all_model_data.keys())[0]
 
@@ -229,6 +229,15 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 <div class="meta-item" style="grid-column:span 2"><div class="label">Coordinates</div><div class="val" id="d-coords"></div></div>
 </div>
 </div>
+
+<div id="comparison-card" class="detail-card" style="display:none;background:rgba(139,92,246,0.05);border-color:rgba(139,92,246,0.2);margin-top:15px">
+<div class="detail-title" style="color:var(--pri);font-size:1.05rem;border-bottom:1px solid rgba(139,92,246,0.1)">Ecological Comparison Report</div>
+<div id="comparison-desc" style="font-size:0.8rem;margin-bottom:12px;color:var(--t1);font-style:italic"></div>
+<div style="font-size:0.7rem;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;font-weight:600">Metric Comparison</div>
+<div id="comparison-metrics" style="display:flex;flex-direction:column;gap:6px;font-size:0.75rem"></div>
+<button id="set-query-btn" class="method-tab" style="width:100%;margin-top:12px;background:var(--pri);color:var(--t1);border:none;border-radius:6px;padding:8px;font-weight:600;box-shadow:0 0 10px var(--glow)">Set as Query Ecosystem</button>
+</div>
+
 <div id="sim-results" style="display:none">
 <h3 class="panel-title" style="font-size:.95rem;margin-bottom:10px">Top Similar Ecosystems</h3>
 <div id="rankings"></div>
@@ -241,6 +250,7 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 <script>
 const ALL_MODEL_DATA={json.dumps(all_model_data)};
 const EVAL={json.dumps(eval_data)};
+const EXPLAIN_DATA={json.dumps(explain_data)};
 const MODEL_LABELS={json.dumps(model_labels)};
 const colors={{'forest':'#10b981','wetland':'#3b82f6','mangrove':'#06b6d4','agricultural':'#f59e0b','urban_green':'#ec4899'}};
 const modelColors={{'prithvi':'#8b5cf6','vit':'#3b82f6','resnet':'#f59e0b'}};
@@ -311,6 +321,7 @@ function switchModel(mk){{
   // Reset search
   document.getElementById('no-sel').style.display='block';
   document.getElementById('detail-card').style.display='none';
+  document.getElementById('comparison-card').style.display='none';
   document.getElementById('sim-results').style.display='none';
 }}
 
@@ -325,6 +336,72 @@ document.querySelectorAll('.method-tab').forEach(btn=>{{btn.addEventListener('cl
 
 document.getElementById('patch-select').addEventListener('change',e=>doSearch(e.target.value));
 
+function showComparison(qid, aid, element) {{
+  const compCard=document.getElementById('comparison-card');
+  const compDesc=document.getElementById('comparison-desc');
+  const compMetrics=document.getElementById('comparison-metrics');
+  const setQueryBtn=document.getElementById('set-query-btn');
+
+  const qDesc=EXPLAIN_DATA.descriptors[qid];
+  const aDesc=EXPLAIN_DATA.descriptors[aid];
+  
+  if(!qDesc || !aDesc) {{
+    compCard.style.display='none';
+    return;
+  }}
+
+  const expObj=(EXPLAIN_DATA.explanations[qid] && EXPLAIN_DATA.explanations[qid][aid]) || {{explanation: "No comparison details available."}};
+  compDesc.textContent=expObj.explanation;
+
+  compMetrics.innerHTML=`
+    <div style="display:grid;grid-template-columns:1fr 80px 80px;border-bottom:1px solid rgba(255,255,255,0.05);padding-bottom:4px;font-weight:600">
+      <span>Indicator</span>
+      <span style="text-align:right;color:var(--t2)">Query</span>
+      <span style="text-align:right;color:var(--t2)">Analog</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px;padding-top:4px">
+      <span>Forest Cover</span>
+      <span style="text-align:right">${{qDesc.forest_cover}}%</span>
+      <span style="text-align:right">${{aDesc.forest_cover}}%</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px">
+      <span>Water Cover</span>
+      <span style="text-align:right">${{qDesc.water_cover}}%</span>
+      <span style="text-align:right">${{aDesc.water_cover}}%</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px">
+      <span>Urban/Bare Soil</span>
+      <span style="text-align:right">${{qDesc.urban_cover}}%</span>
+      <span style="text-align:right">${{aDesc.urban_cover}}%</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px">
+      <span>Veg Health (NDVI)</span>
+      <span style="text-align:right">${{qDesc.veg_health.toFixed(3)}}</span>
+      <span style="text-align:right">${{aDesc.veg_health.toFixed(3)}}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px;padding-bottom:4px">
+      <span>Protected Area</span>
+      <span style="text-align:right;color:${{qDesc.protected_area ? 'var(--green)' : 'var(--orange)'}}">${{qDesc.protected_area ? 'Yes' : 'No'}}</span>
+      <span style="text-align:right;color:${{aDesc.protected_area ? 'var(--green)' : 'var(--orange)'}}">${{aDesc.protected_area ? 'Yes' : 'No'}}</span>
+    </div>
+  `;
+
+  // Highlight selection in list
+  document.querySelectorAll('.ranking-item').forEach(el => {{
+    el.style.borderColor = 'var(--border)';
+    el.style.background = 'rgba(255,255,255,.02)';
+  }});
+  element.style.borderColor = 'var(--pri)';
+  element.style.background = 'rgba(139,92,246,.08)';
+
+  compCard.style.display='block';
+
+  setQueryBtn.onclick=()=>{{
+    document.getElementById('patch-select').value=aid;
+    doSearch(aid);
+  }};
+}}
+
 function doSearch(qid){{
   const md=ALL_MODEL_DATA[currentModel];
   if(!md)return;
@@ -334,6 +411,7 @@ function doSearch(qid){{
 
   document.getElementById('no-sel').style.display='none';
   document.getElementById('detail-card').style.display='block';
+  document.getElementById('comparison-card').style.display='none'; // Reset comparison
   document.getElementById('sim-results').style.display='block';
   document.getElementById('d-name').textContent=d.name;
   document.getElementById('d-id').textContent=d.id;
@@ -347,9 +425,13 @@ function doSearch(qid){{
   const sorted=Object.keys(sims).filter(id=>id!==qid).map(id=>({{id,score:sims[id],meta:D.find(x=>x.id===id)}})).filter(x=>x.meta).sort((a,b)=>b.score-a.score);
 
   const rc=document.getElementById('rankings');rc.innerHTML='';
-  sorted.slice(0,15).forEach(m=>{{const div=document.createElement('div');div.className='ranking-item';div.onclick=()=>{{document.getElementById('patch-select').value=m.id;doSearch(m.id)}};
-  div.innerHTML=`<div><span class="ranking-name">${{m.meta.name}}</span><div class="ranking-meta"><span class="eco-badge badge-${{m.meta.ecosystem}}">${{m.meta.ecosystem}}</span><span>${{m.meta.climatic_region}}</span></div></div><span class="ranking-score">${{m.score.toFixed(4)}}</span>`;
-  rc.appendChild(div)}});
+  sorted.slice(0,15).forEach(m=>{{
+    const div=document.createElement('div');
+    div.className='ranking-item';
+    div.onclick=()=>showComparison(qid, m.id, div);
+    div.innerHTML=`<div><span class="ranking-name">${{m.meta.name}}</span><div class="ranking-meta"><span class="eco-badge badge-${{m.meta.ecosystem}}">${{m.meta.ecosystem}}</span><span>${{m.meta.climatic_region}}</span></div></div><span class="ranking-score">${{m.score.toFixed(4)}}</span>`;
+    rc.appendChild(div);
+  }});
 
   if(scatterChart){{scatterChart.data.datasets.forEach(ds=>{{if(ds.label===qid){{ds.pointRadius=14;ds.borderWidth=3;ds.borderColor='#fff'}}else{{ds.pointRadius=8;ds.borderWidth=1;ds.borderColor='rgba(255,255,255,.4)'}}}});scatterChart.update()}}
 }}
@@ -395,7 +477,17 @@ def main():
     else:
         print(f"Warning: {eval_path} not found. Dashboard will have empty metrics.")
 
-    html = build_html(all_model_data, eval_data, model_labels)
+    # Load explainable retrieval details
+    explain_path = f"{RESULTS_DIR}/explainable_retrieval.json"
+    explain_data = {}
+    if os.path.exists(explain_path):
+        with open(explain_path) as f:
+            explain_data = json.load(f)
+        print("Loaded explainable retrieval database.")
+    else:
+        print(f"Warning: {explain_path} not found. Dashboard will not show comparison explanations.")
+
+    html = build_html(all_model_data, eval_data, explain_data, model_labels)
 
     out_path = "retrieval_dashboard.html"
     with open(out_path, "w", encoding="utf-8") as f:

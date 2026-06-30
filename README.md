@@ -137,3 +137,27 @@ http://localhost:8000/retrieval_dashboard.html
 - **Confusion Matrix:** Heatmap showing retrieval confusion between categories
 - **Enhanced Search:** Multi-method ecosystem similarity search with ranked results
 
+
+---
+
+## 6. Objective 3 — Explainable Similarity Retrieval Framework
+
+These scripts extend the retrieval framework to provide interpretable explanations for similarity results.
+
+### Step 9: Ecosystem Explainability Engine
+```powershell
+python 09_explainability_engine.py
+```
+- **What it does:** Extracts physical land-cover descriptors (Forest Cover %, Water Cover %, Urban/Bare Ground %, and Vegetation Health NDVI) directly from raw Sentinel-2 patches using customized spectral thresholds. Computes pairwise comparisons and generates natural language similarity reports.
+- **Output:** `results/ecosystem_descriptors.json`, `results/explainable_retrieval.json`
+
+### Explore the Explainable Retrieval Dashboard
+```text
+http://localhost:8000/retrieval_dashboard.html
+```
+
+#### New Phase 3 Features:
+- **Ecological Comparison Report:** Renders a comparison card comparing Forest %, Water %, Urban %, Vegetation Health, and Protected Area side-by-side between the query and selected analog.
+- **Interpretable Explanations:** Displays high-quality natural language explanations (e.g. why they match based on dominant indices).
+- **Search Query Pivoting:** Let users easily pivot search queries by setting the compared analog as the new query.
+
