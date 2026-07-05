@@ -42,7 +42,10 @@ def euclidean_similarity(a, b):
 
 
 def compute_model_data(catalog, model_key):
-    """Compute PCA coordinates + similarity matrices for a single model."""
+    """Compute PCA/t-SNE coordinates + similarity matrices for a single model."""
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+
     model_cfg = SUPPORTED_MODELS[model_key]
     emb_dir = model_cfg["embeddings_dir"]
 
@@ -59,13 +62,14 @@ def compute_model_data(catalog, model_key):
 
     X = np.stack(vectors)
 
-    # PCA projection
-    X_mean = X.mean(axis=0)
-    X_centered = X - X_mean
-    cov = np.cov(X_centered, rowvar=False)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    idx = np.argsort(eigenvalues)[::-1]
-    X_2d = X_centered @ eigenvectors[:, idx][:, :2]
+    # 1. PCA projection using sklearn
+    pca = PCA(n_components=2, random_state=42)
+    X_pca = pca.fit_transform(X)
+
+    # 2. t-SNE projection using sklearn
+    perp = min(30, len(valid) - 1)
+    tsne = TSNE(n_components=2, perplexity=perp, random_state=42, init="pca")
+    X_tsne = tsne.fit_transform(X)
 
     # Compute similarity matrices for all three methods
     sims_cos, sims_euc, sims_knn = {}, {}, {}
@@ -73,20 +77,35 @@ def compute_model_data(catalog, model_key):
     for i, id_a in enumerate(ids):
         sims_cos[id_a], sims_euc[id_a], sims_knn[id_a] = {}, {}, {}
         for j, id_b in enumerate(ids):
-            cs = cosine_similarity(vectors[i], vectors[j])
-            es = euclidean_similarity(vectors[i], vectors[j])
+            cs = float(np.dot(vectors[i], vectors[j]))
+            dist = float(np.linalg.norm(vectors[i] - vectors[j]))
+            es = 1.0 / (1.0 + dist)
             sims_cos[id_a][id_b] = cs
             sims_euc[id_a][id_b] = es
             sims_knn[id_a][id_b] = es
 
     dashboard_data = []
     for i, entry in enumerate(valid):
+        # Determine protected status using naming heuristic
+        name_str = entry.get("name", "").lower()
+        is_protected = entry.get("protected_area", False)
+        if "national park" in name_str or "reserve" in name_str or "sanctuary" in name_str or "forest reserve" in name_str:
+            is_protected = True
+
         dashboard_data.append({
-            "id": entry["id"], "ecosystem": entry["ecosystem"],
-            "name": entry["name"], "lon": entry["lon"], "lat": entry["lat"],
-            "protected_area": entry.get("protected_area", False),
+            "id": entry["id"], 
+            "ecosystem": entry["ecosystem"],
+            "name": entry["name"], 
+            "lon": entry["lon"], 
+            "lat": entry["lat"],
+            "protected_area": is_protected,
             "climatic_region": entry.get("climatic_region", "Unknown"),
-            "x": float(X_2d[i, 0]), "y": float(X_2d[i, 1]),
+            "x_pca": float(X_pca[i, 0]), 
+            "y_pca": float(X_pca[i, 1]),
+            "x_tsne": float(X_tsne[i, 0]), 
+            "y_tsne": float(X_tsne[i, 1]),
+            "x": float(X_pca[i, 0]), 
+            "y": float(X_pca[i, 1]),
         })
 
     return {
@@ -111,6 +130,8 @@ def build_html(all_model_data, eval_data, explain_data, model_labels):
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Plus+Jakarta+Sans:wght@300;400;600;700&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 :root {{--bg:#0b0f19;--panel:rgba(20,27,45,.7);--border:rgba(255,255,255,.08);--t1:#f8fafc;--t2:#94a3b8;--pri:#8b5cf6;--glow:rgba(139,92,246,.3);--green:#10b981;--blue:#3b82f6;--orange:#f59e0b;--pink:#ec4899;--cyan:#06b6d4;--ff:'Plus Jakarta Sans',sans-serif;--tf:'Outfit',sans-serif}}
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -202,47 +223,67 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 </div>
 
 <div class="grid-main">
-<div class="panel">
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
-<h2 class="panel-title" style="margin-bottom:0">Similarity Search</h2>
-<div class="method-tabs" id="method-tabs">
-<button class="method-tab active" data-method="cosine">Cosine</button>
-<button class="method-tab" data-method="euclidean">Euclidean</button>
-<button class="method-tab" data-method="knn">kNN</button>
-</div>
-</div>
-<div class="chart-box" style="height:450px"><canvas id="scatter-chart"></canvas></div>
-</div>
-<div class="panel">
-<h2 class="panel-title">Ecosystem Search Database</h2>
-<select id="patch-select" class="search-select">
-<option value="" disabled selected>Select a patch to search...</option>
-</select>
-<div id="no-sel" class="no-sel">Select a patch or click a point on the scatter plot.</div>
-<div id="detail-card" class="detail-card">
-<div class="detail-title" id="d-name">Name</div>
-<div class="meta-grid">
-<div class="meta-item"><div class="label">ID</div><div class="val" id="d-id"></div></div>
-<div class="meta-item"><div class="label">Category</div><div class="val" id="d-cat"></div></div>
-<div class="meta-item"><div class="label">Climate</div><div class="val" id="d-climate"></div></div>
-<div class="meta-item"><div class="label">Protected</div><div class="val" id="d-prot"></div></div>
-<div class="meta-item" style="grid-column:span 2"><div class="label">Coordinates</div><div class="val" id="d-coords"></div></div>
-</div>
-</div>
+<div> <!-- Left Column -->
+  <div class="panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <h2 class="panel-title" style="margin-bottom:0">Similarity Search</h2>
+      <div style="display:flex;gap:15px;align-items:center">
+        <div class="method-tabs" style="margin-bottom:0">
+          <button id="btn-pca" class="method-tab active">PCA</button>
+          <button id="btn-tsne" class="method-tab">t-SNE</button>
+        </div>
+        <div class="method-tabs" id="method-tabs" style="margin-bottom:0">
+          <button class="method-tab active" data-method="cosine">Cosine</button>
+          <button class="method-tab" data-method="euclidean">Euclidean</button>
+          <button class="method-tab" data-method="knn">kNN</button>
+        </div>
+      </div>
+    </div>
+    <div class="chart-box" style="height:450px"><canvas id="scatter-chart"></canvas></div>
+  </div>
 
-<div id="comparison-card" class="detail-card" style="display:none;background:rgba(139,92,246,0.05);border-color:rgba(139,92,246,0.2);margin-top:15px">
-<div class="detail-title" style="color:var(--pri);font-size:1.05rem;border-bottom:1px solid rgba(139,92,246,0.1)">Ecological Comparison Report</div>
-<div id="comparison-desc" style="font-size:0.8rem;margin-bottom:12px;color:var(--t1);font-style:italic"></div>
-<div style="font-size:0.7rem;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;font-weight:600">Metric Comparison</div>
-<div id="comparison-metrics" style="display:flex;flex-direction:column;gap:6px;font-size:0.75rem"></div>
-<button id="set-query-btn" class="method-tab" style="width:100%;margin-top:12px;background:var(--pri);color:var(--t1);border:none;border-radius:6px;padding:8px;font-weight:600;box-shadow:0 0 10px var(--glow)">Set as Query Ecosystem</button>
-</div>
+  <div class="panel" id="leaflet-map-panel" style="display:none">
+    <h2 class="panel-title">Geographic Analog Connections & Clusters</h2>
+    <div id="leaflet-map" style="height:400px;width:100%;border-radius:12px;border:1px solid var(--border);background:#0f172a"></div>
+  </div>
+</div> <!-- End Left Column -->
 
-<div id="sim-results" style="display:none">
-<h3 class="panel-title" style="font-size:.95rem;margin-bottom:10px">Top Similar Ecosystems</h3>
-<div id="rankings"></div>
-</div>
-</div>
+<div class="panel"> <!-- Right Column -->
+  <h2 class="panel-title">Ecosystem Search Database</h2>
+  <select id="patch-select" class="search-select">
+    <option value="" disabled selected>Select a location...</option>
+  </select>
+  <div id="no-sel" class="no-sel">Select a location or click a point on the scatter plot.</div>
+
+  <div id="detail-card" class="detail-card">
+    <div class="detail-title" id="d-name">Name</div>
+    <div class="meta-grid">
+      <div class="meta-item"><div class="label">ID</div><div class="val" id="d-id"></div></div>
+      <div class="meta-item"><div class="label">Category</div><div class="val" id="d-cat"></div></div>
+      <div class="meta-item"><div class="label">Climate</div><div class="val" id="d-climate"></div></div>
+      <div class="meta-item"><div class="label">Protected</div><div class="val" id="d-prot"></div></div>
+      <div class="meta-item" style="grid-column:span 2"><div class="label">Coordinates</div><div class="val" id="d-coords"></div></div>
+    </div>
+  </div>
+
+  <div id="comparison-card" class="detail-card" style="display:none;background:rgba(139,92,246,0.05);border-color:rgba(139,92,246,0.2);margin-top:15px">
+    <div class="detail-title" style="color:var(--pri);font-size:1.05rem;border-bottom:1px solid rgba(139,92,246,0.1)">Ecological Comparison Report</div>
+    <div id="comparison-desc" style="font-size:0.8rem;margin-bottom:12px;color:var(--t1);font-style:italic"></div>
+    <div style="font-size:0.7rem;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px;font-weight:600">Metric Comparison</div>
+    <div id="comparison-metrics" style="display:flex;flex-direction:column;gap:6px;font-size:0.75rem"></div>
+
+    <div style="margin-top:15px;height:240px;position:relative">
+      <canvas id="radar-chart"></canvas>
+    </div>
+
+    <button id="set-query-btn" class="method-tab" style="width:100%;margin-top:12px;background:var(--pri);color:var(--t1);border:none;border-radius:6px;padding:8px;font-weight:600;box-shadow:0 0 10px var(--glow)">Set as Query Ecosystem</button>
+  </div>
+
+  <div id="sim-results" style="display:none">
+    <h3 class="panel-title" style="font-size:.95rem;margin-bottom:10px">Top Similar Ecosystems</h3>
+    <div id="rankings"></div>
+  </div>
+</div> <!-- End Right Column -->
 </div>
 <div class="footer"><p>EcoLens - Multi-Model Ecosystem Similarity Retrieval Framework | Prithvi-100M, ViT-Base, ResNet-50</p></div>
 </div>
@@ -256,9 +297,25 @@ const colors={{'forest':'#10b981','wetland':'#3b82f6','mangrove':'#06b6d4','agri
 const modelColors={{'prithvi':'#8b5cf6','vit':'#3b82f6','resnet':'#f59e0b'}};
 let currentModel='{default_model}';
 let currentMethod='cosine';
+let currentProjection='pca';
 let scatterChart=null;
 let catChart=null;
 let crossModelChart=null;
+
+// Leaflet Map State
+let map=null;
+let markersLayer=null;
+let mapLinesLayer=null;
+
+function initMap() {{
+  if(map)return;
+  map=L.map('leaflet-map',{{zoomControl:true,attributionControl:false}}).setView([20,0],2);
+  L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png',{{
+    maxZoom:19
+  }}).addTo(map);
+  markersLayer=L.layerGroup().addTo(map);
+  mapLinesLayer=L.layerGroup().addTo(map);
+}}
 
 // Populate model selector
 const modelSel=document.getElementById('model-select');
@@ -283,28 +340,86 @@ function buildCrossModelChart(){{
 }}
 buildCrossModelChart();
 
+function setProjection(proj) {{
+  currentProjection=proj;
+  document.getElementById('btn-pca').classList.toggle('active',proj==='pca');
+  document.getElementById('btn-tsne').classList.toggle('active',proj==='tsne');
+  
+  if(scatterChart){{
+    scatterChart.data.datasets.forEach(ds=>{{
+      const m=ds.meta;
+      if(proj==='pca'){{
+        ds.data[0].x=m.x_pca;
+        ds.data[0].y=m.y_pca;
+      }}else{{
+        ds.data[0].x=m.x_tsne;
+        ds.data[0].y=m.y_tsne;
+      }}
+    }});
+    scatterChart.options.scales.x.title.text=proj.toUpperCase()+' 1';
+    scatterChart.options.scales.y.title.text=proj.toUpperCase()+' 2';
+    scatterChart.update();
+  }}
+}}
+
 function switchModel(mk){{
   currentModel=mk;
   const md=ALL_MODEL_DATA[mk];
   if(!md)return;
   const D=md.dashboard_data;
-  // Update stats
+  
+  // Re-populate Leaflet Map with only base locations initially
+  initMap();
+  markersLayer.clearLayers();
+  mapLinesLayer.clearLayers();
+  D.forEach(d=>{{
+    if (!d.id.endsWith('_p0')) return; // Show only base locations initially
+    const color=colors[d.ecosystem]||'#8b5cf6';
+    const baseName=d.name.replace(' (Patch #1)', '');
+    const marker=L.circleMarker([d.lat,d.lon],{{
+      radius:6,
+      fillColor:color,
+      color:'#ffffff',
+      weight:1,
+      fillOpacity:0.8
+    }});
+    marker.bindPopup('<b>'+baseName+'</b>');
+    marker.on('click',()=>{{
+      document.getElementById('patch-select').value=d.id;
+      doSearch(d.id);
+    }});
+    markersLayer.addLayer(marker);
+  }});
+
+  // Update stats (Count unique locations instead of raw sub-patches)
   const ev=EVAL[mk]||{{}};
-  document.getElementById('stat-patches').textContent=D.length;
+  const uniqueLocCount = D.filter(d => d.id.endsWith('_p0')).length;
+  document.getElementById('stat-patches').textContent=uniqueLocCount;
   document.getElementById('stat-map').textContent=(ev.cosine?.overall?.mAP||0).toFixed(3);
   document.getElementById('stat-mrr').textContent=(ev.cosine?.overall?.MRR||0).toFixed(3);
   document.getElementById('model-desc').textContent=(MODEL_LABELS[mk]||mk);
 
-  // Rebuild dropdown
+  // Rebuild dropdown with only base locations
   const sel=document.getElementById('patch-select');
-  sel.innerHTML='<option value="" disabled selected>Select a patch to search...</option>';
-  D.forEach(d=>{{const o=document.createElement('option');o.value=d.id;o.textContent=`[${{d.ecosystem.toUpperCase()}}] ${{d.name}} (${{d.id}})`;sel.appendChild(o)}});
+  sel.innerHTML='<option value="" disabled selected>Select a location...</option>';
+  D.forEach(d=>{{
+    if (d.id.endsWith('_p0')) {{
+      const baseName=d.name.replace(' (Patch #1)', '');
+      const o=document.createElement('option');
+      o.value=d.id;
+      o.textContent=`[${{d.ecosystem.toUpperCase()}}] ${{baseName}}`;
+      sel.appendChild(o);
+    }}
+  }});
 
-  // Rebuild scatter chart
+  // Rebuild scatter chart (shows all 710 patches to display intra-class feature spread)
   const ctx=document.getElementById('scatter-chart').getContext('2d');
   if(scatterChart)scatterChart.destroy();
-  const scatterData={{datasets:D.map(d=>({{label:d.id,data:[{{x:d.x,y:d.y}}],backgroundColor:colors[d.ecosystem]||'#8b5cf6',pointRadius:8,pointHoverRadius:11,borderColor:'rgba(255,255,255,.4)',borderWidth:1,meta:d}}))}}; 
-  scatterChart=new Chart(ctx,{{type:'scatter',data:scatterData,options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:c=>{{const m=c.dataset.meta;return[`${{m.id}}: ${{m.name}}`,`Ecosystem: ${{m.ecosystem.toUpperCase()}}`,`Climate: ${{m.climatic_region}}`]}}}}}}}},scales:{{x:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC1',color:'#94a3b8'}}}},y:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC2',color:'#94a3b8'}}}}}},onClick:(e,el)=>{{if(el.length){{const m=scatterChart.data.datasets[el[0].datasetIndex].meta;sel.value=m.id;doSearch(m.id)}}}}}}}});
+  const scatterData={{datasets:D.map(d=>({{label:d.id,data:[{{x:d.x_pca,y:d.y_pca}}],backgroundColor:colors[d.ecosystem]||'#8b5cf6',pointRadius:6,pointHoverRadius:9,borderColor:'rgba(255,255,255,.2)',borderWidth:1,meta:d}}))}}; 
+  scatterChart=new Chart(ctx,{{type:'scatter',data:scatterData,options:{{responsive:true,maintainAspectRatio:false,plugins:{{legend:{{display:false}},tooltip:{{callbacks:{{label:c=>{{const m=c.dataset.meta;return[`${{m.id}}: ${{m.name}}`,`Ecosystem: ${{m.ecosystem.toUpperCase()}}`,`Climate: ${{m.climatic_region}}`]}}}}}}}},scales:{{x:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC1',color:'#94a3b8'}}}},y:{{grid:{{color:'rgba(255,255,255,.05)'}},ticks:{{display:false}},title:{{display:true,text:'PC2',color:'#94a3b8'}}}}}},onClick:(e,el)=>{{if(el.length){{const m=scatterChart.data.datasets[el[0].datasetIndex].meta;const baseId=m.id.split('_p')[0] + '_p0';sel.value=baseId;doSearch(baseId)}}}}}}}});
+
+  // Reset projection display to PCA
+  setProjection('pca');
 
   // Rebuild category chart
   const cats=Object.keys(ev.cosine?.per_category||{{}}).sort();
@@ -321,6 +436,7 @@ function switchModel(mk){{
   // Reset search
   document.getElementById('no-sel').style.display='block';
   document.getElementById('detail-card').style.display='none';
+  document.getElementById('leaflet-map-panel').style.display='none';
   document.getElementById('comparison-card').style.display='none';
   document.getElementById('sim-results').style.display='none';
 }}
@@ -333,6 +449,10 @@ modelSel.addEventListener('change',e=>switchModel(e.target.value));
 
 // Method tabs
 document.querySelectorAll('.method-tab').forEach(btn=>{{btn.addEventListener('click',()=>{{document.querySelectorAll('.method-tab').forEach(b=>b.classList.remove('active'));btn.classList.add('active');currentMethod=btn.dataset.method;const qid=document.getElementById('patch-select').value;if(qid)doSearch(qid)}})}});
+
+// Projection Buttons click handlers
+document.getElementById('btn-pca').addEventListener('click',()=>setProjection('pca'));
+document.getElementById('btn-tsne').addEventListener('click',()=>setProjection('tsne'));
 
 document.getElementById('patch-select').addEventListener('change',e=>doSearch(e.target.value));
 
@@ -379,12 +499,103 @@ function showComparison(qid, aid, element) {{
       <span style="text-align:right">${{qDesc.veg_health.toFixed(3)}}</span>
       <span style="text-align:right">${{aDesc.veg_health.toFixed(3)}}</span>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 80px 80px;padding-bottom:4px">
+    <div style="display:grid;grid-template-columns:1fr 80px 80px">
+      <span>Altitude (m)</span>
+      <span style="text-align:right">${{qDesc.elevation}}m</span>
+      <span style="text-align:right">${{aDesc.elevation}}m</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px">
+      <span>Temperature (°C)</span>
+      <span style="text-align:right">${{qDesc.temp}}°C</span>
+      <span style="text-align:right">${{aDesc.temp}}°C</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px">
+      <span>Rainfall (mm)</span>
+      <span style="text-align:right">${{qDesc.rainfall}}mm</span>
+      <span style="text-align:right">${{aDesc.rainfall}}mm</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px">
+      <span>Soil Type</span>
+      <span style="text-align:right;font-size:0.65rem;color:var(--t2)">${{qDesc.soil}}</span>
+      <span style="text-align:right;font-size:0.65rem;color:var(--t2)">${{aDesc.soil}}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px;border-bottom:1px solid rgba(255,255,255,0.05);padding-bottom:4px">
+      <span>Ecoregion</span>
+      <span style="text-align:right;font-size:0.65rem;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{qDesc.ecoregion}}">${{qDesc.ecoregion}}</span>
+      <span style="text-align:right;font-size:0.65rem;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{aDesc.ecoregion}}">${{aDesc.ecoregion}}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 80px 80px;padding-top:4px">
       <span>Protected Area</span>
       <span style="text-align:right;color:${{qDesc.protected_area ? 'var(--green)' : 'var(--orange)'}}">${{qDesc.protected_area ? 'Yes' : 'No'}}</span>
       <span style="text-align:right;color:${{aDesc.protected_area ? 'var(--green)' : 'var(--orange)'}}">${{aDesc.protected_area ? 'Yes' : 'No'}}</span>
     </div>
   `;
+
+  // Draw Radar Comparison Chart
+  const radarCtx = document.getElementById('radar-chart').getContext('2d');
+  if (window.radarChartInst) {{
+    window.radarChartInst.destroy();
+  }}
+  
+  const qVals = [
+    qDesc.forest_cover || 0,
+    qDesc.water_cover || 0,
+    qDesc.urban_cover || 0,
+    (qDesc.veg_health || 0) * 100,
+    (qDesc.elevation || 0) / 30.0,
+    (qDesc.temp || 0) * 2.8
+  ];
+  
+  const aVals = [
+    aDesc.forest_cover || 0,
+    aDesc.water_cover || 0,
+    aDesc.urban_cover || 0,
+    (aDesc.veg_health || 0) * 100,
+    (aDesc.elevation || 0) / 30.0,
+    (aDesc.temp || 0) * 2.8
+  ];
+
+  window.radarChartInst = new Chart(radarCtx, {{
+    type: 'radar',
+    data: {{
+      labels: ['Forest Cover %', 'Water Cover %', 'Urban/Bare %', 'Veg Health (NDVI x100)', 'Elevation (scaled)', 'Temperature (scaled)'],
+      datasets: [
+        {{
+          label: 'Query (' + qid + ')',
+          data: qVals,
+          backgroundColor: 'rgba(139, 92, 246, 0.2)',
+          borderColor: 'rgba(139, 92, 246, 0.8)',
+          pointBackgroundColor: 'rgba(139, 92, 246, 1)',
+          borderWidth: 2
+        }},
+        {{
+          label: 'Analog (' + aid + ')',
+          data: aVals,
+          backgroundColor: 'rgba(16, 185, 129, 0.2)',
+          borderColor: 'rgba(16, 185, 129, 0.8)',
+          pointBackgroundColor: 'rgba(16, 185, 129, 1)',
+          borderWidth: 2
+        }}
+      ]
+    }},
+    options: {{
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {{
+        legend: {{ labels: {{ color: '#94a3b8', font: {{ size: 9 }} }} }}
+      }},
+      scales: {{
+        r: {{
+          grid: {{ color: 'rgba(255, 255, 255, 0.05)' }},
+          angleLines: {{ color: 'rgba(255, 255, 255, 0.05)' }},
+          pointLabels: {{ color: '#94a3b8', font: {{ size: 8 }} }},
+          ticks: {{ display: false }},
+          suggestedMin: 0,
+          suggestedMax: 100
+        }}
+      }}
+    }}
+  }});
 
   // Highlight selection in list
   document.querySelectorAll('.ranking-item').forEach(el => {{
@@ -409,11 +620,14 @@ function doSearch(qid){{
   const d=D.find(x=>x.id===qid);
   if(!d)return;
 
+  const qBase = qid.split('_p')[0];
+  const baseName = d.name.replace(' (Patch #1)', '');
+
   document.getElementById('no-sel').style.display='none';
   document.getElementById('detail-card').style.display='block';
   document.getElementById('comparison-card').style.display='none'; // Reset comparison
   document.getElementById('sim-results').style.display='block';
-  document.getElementById('d-name').textContent=d.name;
+  document.getElementById('d-name').textContent=baseName;
   document.getElementById('d-id').textContent=d.id;
   document.getElementById('d-cat').textContent=d.ecosystem.toUpperCase();
   document.getElementById('d-climate').textContent=d.climatic_region;
@@ -422,18 +636,101 @@ function doSearch(qid){{
 
   const simKey=currentMethod==='knn'?'sims_knn':currentMethod==='euclidean'?'sims_euc':'sims_cos';
   const sims=md[simKey]?.[qid]||{{}};
-  const sorted=Object.keys(sims).filter(id=>id!==qid).map(id=>({{id,score:sims[id],meta:D.find(x=>x.id===id)}})).filter(x=>x.meta).sort((a,b)=>b.score-a.score);
+
+  // 1. Filter out patches from the query location, and group other patches by base location ID
+  const grouped = {{}};
+  Object.keys(sims).forEach(id => {{
+    const cBase = id.split('_p')[0];
+    if (cBase === qBase) return; // Skip sub-crops of same location
+    
+    const score = sims[id];
+    const meta = D.find(x => x.id === id);
+    if (!meta) return;
+    
+    if (!grouped[cBase] || score > grouped[cBase].score) {{
+      grouped[cBase] = {{ id, score, meta }};
+    }}
+  }});
+
+  // Sort locations by their best matching sub-patch score
+  const sorted = Object.values(grouped).sort((a, b) => b.score - a.score);
+
+  // Update Leaflet map with query flyTo and similarity line markers
+  document.getElementById('leaflet-map-panel').style.display='block';
+  initMap();
+  if (map) {{
+    map.invalidateSize();
+  }}
+  mapLinesLayer.clearLayers();
+  
+  // Fly to global view (zoom 2) to see global connections by default, allowing manual zoom in/out
+  map.flyTo([d.lat, d.lon], 2, {{animate:true, duration:1.2}});
+  
+  // Plot all 10 sub-patches of the query location
+  const qSubPatches = D.filter(x => x.id.split('_p')[0] === qBase);
+  qSubPatches.forEach(sp => {{
+    const isExact = sp.id === qid;
+    L.circleMarker([sp.lat, sp.lon], {{
+      radius: isExact ? 10 : 6,
+      fillColor: colors[d.ecosystem] || '#8b5cf6',
+      color: isExact ? '#ffd700' : '#ffffff',
+      weight: isExact ? 3 : 1,
+      fillOpacity: isExact ? 0.9 : 0.6
+    }}).addTo(mapLinesLayer).bindPopup(`<b>${{baseName}}</b><br>Sub-Patch: ${{sp.id}}${{isExact ? ' (Selected)' : ''}}`);
+  }});
+  
+  // Plot and connect top 5 closest location analogs
+  sorted.slice(0, 5).forEach((m, idx) => {{
+    const analogName = m.meta.name.split(' (Patch #')[0];
+    L.circleMarker([m.meta.lat, m.meta.lon], {{
+      radius: 8,
+      fillColor: colors[m.meta.ecosystem] || '#3b82f6',
+      color: '#ffffff',
+      weight: 2,
+      fillOpacity: 0.8
+    }}).addTo(mapLinesLayer).bindPopup(`<b>Analog #${{idx+1}}: ${{analogName}}</b><br>Match Score: ${{m.score.toFixed(4)}}<br>(Via Sub-Patch ${{m.id}})`);
+    
+    L.polyline([[d.lat, d.lon], [m.meta.lat, m.meta.lon]], {{
+      color: 'rgba(139,92,246,0.4)',
+      weight: 1.5,
+      dashArray: '4, 4'
+    }}).addTo(mapLinesLayer);
+  }});
 
   const rc=document.getElementById('rankings');rc.innerHTML='';
   sorted.slice(0,15).forEach(m=>{{
+    const analogName = m.meta.name.split(' (Patch #')[0];
+    const patchSuffix = m.id.split('_p')[1];
     const div=document.createElement('div');
     div.className='ranking-item';
     div.onclick=()=>showComparison(qid, m.id, div);
-    div.innerHTML=`<div><span class="ranking-name">${{m.meta.name}}</span><div class="ranking-meta"><span class="eco-badge badge-${{m.meta.ecosystem}}">${{m.meta.ecosystem}}</span><span>${{m.meta.climatic_region}}</span></div></div><span class="ranking-score">${{m.score.toFixed(4)}}</span>`;
+    div.innerHTML=`<div><span class="ranking-name">${{analogName}}</span><div class="ranking-meta"><span class="eco-badge badge-${{m.meta.ecosystem}}">${{m.meta.ecosystem}}</span><span>${{m.meta.climatic_region}} (p${{patchSuffix}})</span></div></div><span class="ranking-score">${{m.score.toFixed(4)}}</span>`;
     rc.appendChild(div);
   }});
 
-  if(scatterChart){{scatterChart.data.datasets.forEach(ds=>{{if(ds.label===qid){{ds.pointRadius=14;ds.borderWidth=3;ds.borderColor='#fff'}}else{{ds.pointRadius=8;ds.borderWidth=1;ds.borderColor='rgba(255,255,255,.4)'}}}});scatterChart.update()}}
+  // Dynamic point highlight on scatter plot
+  if(scatterChart){{
+    scatterChart.data.datasets.forEach(ds=>{{
+      const pid=ds.label;
+      if(pid===qid){{
+        ds.pointStyle='rectRot';
+        ds.pointRadius=14;
+        ds.borderWidth=3;
+        ds.borderColor='#ffd700';
+      }}else if(sorted.slice(0,5).some(item=>item.id===pid)){{
+        ds.pointStyle='circle';
+        ds.pointRadius=10;
+        ds.borderWidth=2;
+        ds.borderColor='#ffffff';
+      }}else{{
+        ds.pointStyle='circle';
+        ds.pointRadius=6;
+        ds.borderWidth=1;
+        ds.borderColor='rgba(255,255,255,.2)';
+      }}
+    }});
+    scatterChart.update();
+  }}
 }}
 </script>
 </body>

@@ -19,6 +19,8 @@ import argparse
 import json
 import os
 import numpy as np
+import faiss
+from tqdm import tqdm
 
 from config import (
     METADATA_CATALOG_PATH, EMBEDDINGS_DIR,
@@ -28,49 +30,18 @@ from config import (
 
 
 # ---------------------------------------------------------------
-# Similarity Measures
-# ---------------------------------------------------------------
-
-def cosine_similarity(a, b):
-    """
-    Compute cosine similarity between two vectors.
-    Returns a value in [-1, 1], where 1 means identical direction.
-    """
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return float(np.dot(a, b) / (norm_a * norm_b))
-
-
-def euclidean_similarity(a, b):
-    """
-    Compute similarity based on Euclidean (L2) distance.
-    Converts distance to a similarity score: 1 / (1 + distance).
-    Returns a value in (0, 1], where 1 means identical vectors.
-    """
-    dist = float(np.linalg.norm(a - b))
-    return 1.0 / (1.0 + dist)
-
-
-def euclidean_distance(a, b):
-    """Compute raw Euclidean (L2) distance between two vectors."""
-    return float(np.linalg.norm(a - b))
-
-
-# ---------------------------------------------------------------
-# Retrieval Engine
+# Retrieval Engine (FAISS-Accelerated)
 # ---------------------------------------------------------------
 
 class EcosystemRetrievalEngine:
     """
-    Retrieval engine that indexes ecosystem embeddings and supports
+    Retrieval engine that indexes ecosystem embeddings using FAISS and supports
     similarity search using multiple measures.
 
     Supports three methods as defined in the project proposal:
-      - 'cosine'    : Cosine Similarity
-      - 'euclidean' : Euclidean Distance (converted to similarity)
-      - 'knn'       : k-Nearest Neighbor retrieval (using Euclidean distance)
+      - 'cosine'    : Cosine Similarity (via faiss.IndexFlatIP on L2 normalized embeddings)
+      - 'euclidean' : Euclidean Distance (converted to similarity via 1 / (1 + dist))
+      - 'knn'       : k-Nearest Neighbor retrieval (Euclidean distance search via IndexFlatL2)
     """
 
     SUPPORTED_METHODS = ["cosine", "euclidean", "knn"]
@@ -84,103 +55,107 @@ class EcosystemRetrievalEngine:
         self.catalog = {entry["id"]: entry for entry in catalog}
         self.embeddings = embeddings
         self.ids = list(embeddings.keys())
+        
+        # Build FAISS indices
+        # Load and stack all vectors as float32 matrix
+        matrix = np.vstack([self.embeddings[pid] for pid in self.ids]).astype(np.float32)
+        N, D = matrix.shape
+        
+        # Verify L2-normalization for Cosine similarity (IndexFlatIP)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        normalized_matrix = matrix / (norms + 1e-8)
+        
+        self.index_cos = faiss.IndexFlatIP(D)
+        self.index_cos.add(normalized_matrix)
+        
+        # Euclidean index (IndexFlatL2)
+        self.index_l2 = faiss.IndexFlatL2(D)
+        self.index_l2.add(matrix)
 
     def search(self, query_id, method="cosine", top_k=DEFAULT_TOP_K):
         """
         Retrieve top-K most similar ecosystems for a given query patch.
-
-        Args:
-            query_id: ID of the query patch (e.g., "forest_001")
-            method: similarity method — "cosine", "euclidean", or "knn"
-            top_k: number of results to return
-
-        Returns:
-            list of dicts, each with:
-              - id, score, ecosystem, name, lon, lat,
-                protected_area, climatic_region, rank
+        Uses FAISS for sub-linear search complexity.
         """
         if query_id not in self.embeddings:
             raise ValueError(f"Query ID '{query_id}' not found in embeddings.")
         if method not in self.SUPPORTED_METHODS:
             raise ValueError(f"Unsupported method '{method}'. Use one of: {self.SUPPORTED_METHODS}")
 
-        query_vec = self.embeddings[query_id]
-        scores = []
+        query_vec = self.embeddings[query_id].astype(np.float32).reshape(1, -1)
+        N = len(self.ids)
+        k_to_search = min(top_k + 1, N)
+        
+        if method == "cosine":
+            # Normalizing the query vector for cosine search
+            q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+            scores, indices = self.index_cos.search(q_norm, k_to_search)
+            scores = scores[0]
+            indices = indices[0]
+        elif method == "euclidean":
+            # L2 distance search
+            squared_dists, indices = self.index_l2.search(query_vec, k_to_search)
+            dists = np.sqrt(np.clip(squared_dists[0], 0, None))
+            scores = 1.0 / (1.0 + dists)
+            indices = indices[0]
+        elif method == "knn":
+            # Proper kNN: search L2 index for distances
+            squared_dists, indices = self.index_l2.search(query_vec, k_to_search)
+            dists = np.sqrt(np.clip(squared_dists[0], 0, None))
+            scores = dists # we output distance or similarity
+            indices = indices[0]
 
-        for candidate_id in self.ids:
+        results = []
+        for i in range(len(indices)):
+            idx = indices[i]
+            if idx == -1:
+                continue
+            candidate_id = self.ids[idx]
             if candidate_id == query_id:
                 continue
-
-            candidate_vec = self.embeddings[candidate_id]
-
-            if method == "cosine":
-                score = cosine_similarity(query_vec, candidate_vec)
-            elif method == "euclidean":
-                score = euclidean_similarity(query_vec, candidate_vec)
-            elif method == "knn":
-                # kNN uses Euclidean distance — lower is better,
-                # so we negate for consistent descending sort
-                dist = euclidean_distance(query_vec, candidate_vec)
-                score = -dist
-            else:
-                raise ValueError(f"Unknown method: {method}")
-
+                
             entry = self.catalog[candidate_id]
-            scores.append({
+            res = {
                 "id": candidate_id,
-                "score": score,
                 "ecosystem": entry["ecosystem"],
                 "name": entry["name"],
                 "lon": entry["lon"],
                 "lat": entry["lat"],
                 "protected_area": entry.get("protected_area", False),
                 "climatic_region": entry.get("climatic_region", "Unknown"),
-            })
-
-        # Sort by score descending (highest similarity / closest neighbor first)
-        scores.sort(key=lambda x: x["score"], reverse=True)
-
-        # For kNN, convert back to positive distance for readability
-        if method == "knn":
-            for item in scores:
-                item["distance"] = -item["score"]
-                item["score"] = euclidean_similarity(
-                    self.embeddings[query_id],
-                    self.embeddings[item["id"]]
-                )
-
+            }
+            
+            if method == "cosine":
+                res["score"] = float(scores[i])
+            elif method == "euclidean":
+                res["score"] = float(scores[i])
+            elif method == "knn":
+                res["distance"] = float(scores[i])
+                res["score"] = 1.0 / (1.0 + float(scores[i])) # similarity mapping
+                
+            results.append(res)
+            
         # Add rank
-        for rank, item in enumerate(scores, 1):
+        for rank, item in enumerate(results, 1):
             item["rank"] = rank
-
-        return scores[:top_k]
+            
+        return results[:top_k]
 
     def search_all(self, method="cosine", top_k=DEFAULT_TOP_K):
         """
-        Run retrieval for every patch as a query (leave-one-out).
-
-        Returns:
-            dict mapping query_id -> list of ranked results
+        Run retrieval for every patch as a query (leave-one-out) using tqdm progress bar.
         """
         results = {}
-        for query_id in self.ids:
+        for query_id in tqdm(self.ids, desc=f"FAISS {method.upper()} Search"):
             results[query_id] = self.search(query_id, method=method, top_k=top_k)
         return results
 
     def build_analog_database(self, method="cosine", top_k=DEFAULT_TOP_K):
         """
-        Build the ecosystem analog database — for each patch, store its
-        top-K most similar ecological analogs.
-
-        This produces the 'Ecosystem analog database' expected output
-        from the project proposal.
-
-        Returns:
-            list of dicts, each with query info + its analogs
+        Build the ecosystem analog database using a tqdm progress bar.
         """
         analog_db = []
-
-        for query_id in self.ids:
+        for query_id in tqdm(self.ids, desc="Building Analog DB"):
             entry = self.catalog[query_id]
             analogs = self.search(query_id, method=method, top_k=top_k)
 
@@ -195,7 +170,6 @@ class EcosystemRetrievalEngine:
                 "method": method,
                 "analogs": analogs,
             })
-
         return analog_db
 
 

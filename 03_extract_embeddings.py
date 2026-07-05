@@ -168,7 +168,7 @@ def extract_timm_embedding(model, rgb_tensor):
 # ---------------------------------------------------------------
 
 def run_prithvi(catalog):
-    """Extract embeddings using the Prithvi-100M geospatial model."""
+    """Extract embeddings using the Prithvi-100M geospatial model in batches."""
     emb_dir = SUPPORTED_MODELS["prithvi"]["embeddings_dir"]
     os.makedirs(emb_dir, exist_ok=True)
 
@@ -176,42 +176,58 @@ def run_prithvi(catalog):
     model = load_prithvi_model()
     print("Model loaded.")
 
-    updated_catalog = []
+    # Filter out valid entries that need extraction
+    entries_to_process = []
     for entry in catalog:
         if "processed_path" not in entry:
-            print(f"[{entry['id']}] No processed patch found -- run "
-                  f"02_preprocess_patches.py first. Skipping.")
+            print(f"[{entry['id']}] No processed patch found -- run 02_preprocess_patches.py first. Skipping.")
             continue
-
         out_path = f"{emb_dir}/{entry['id']}.npy"
-        if "embedding_path" in entry and os.path.exists(out_path):
-            print(f"[{entry['id']}] Embedding already exists. Skipping inference.")
-            updated_catalog.append(entry)
+        # Always store the embedding path in the entry
+        entry["prithvi_embedding"] = out_path
+        if os.path.exists(out_path):
             continue
+        entries_to_process.append(entry)
 
-        patch = np.load(entry["processed_path"])
-        patch_tensor = torch.from_numpy(patch).float()
+    if entries_to_process:
+        print(f"Extracting embeddings for {len(entries_to_process)} patches...")
+        from tqdm import tqdm
+        batch_size = 16
+        
+        # Batch loop
+        for i in tqdm(range(0, len(entries_to_process), batch_size), desc="Prithvi Batch Extraction"):
+            batch_entries = entries_to_process[i:i+batch_size]
+            
+            # Load and stack tensors
+            tensors = []
+            for entry in batch_entries:
+                patch = np.load(entry["processed_path"])
+                tensors.append(torch.from_numpy(patch).float().unsqueeze(1)) # (C, 1, H, W)
+                
+            batch_x = torch.stack(tensors).to(DEVICE) # (B, C, 1, H, W)
+            
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
+                    # forward_features expects (B, C, T, H, W)
+                    latent = model.forward_features(batch_x)[-1] # (B, num_patches+1, embed_dim)
+                    patch_tokens = latent[:, 1:, :]
+                    pooled = patch_tokens.mean(dim=1).cpu().numpy() # (B, embed_dim)
+                    
+            # L2 Normalize and save
+            for idx, entry in enumerate(batch_entries):
+                emb = pooled[idx].astype(np.float32)
+                # L2 normalize
+                emb /= np.linalg.norm(emb) + 1e-8
+                out_path = entry["prithvi_embedding"]
+                np.save(out_path, emb)
+    else:
+        print("All Prithvi embeddings already exist.")
 
-        try:
-            embedding = extract_embedding(model, patch_tensor)
-        except Exception as e:
-            print(f"[{entry['id']}] Inference failed: {e}")
-            continue
-
-        np.save(out_path, embedding)
-
-        entry["embedding_path"] = out_path
-        entry["embedding_dim"] = int(embedding.shape[0])
-        updated_catalog.append(entry)
-
-        print(f"[{entry['id']}] embedding shape={embedding.shape}, "
-              f"norm={np.linalg.norm(embedding):.3f}")
-
-    return updated_catalog
+    return catalog
 
 
 def run_timm_model(catalog, model_key):
-    """Extract embeddings using a timm model (ViT-Base or ResNet-50)."""
+    """Extract embeddings using a timm model (ViT-Base or ResNet-50) in batches."""
     model_cfg = SUPPORTED_MODELS[model_key]
     emb_dir = model_cfg["embeddings_dir"]
     timm_name = model_cfg["timm_name"]
@@ -222,35 +238,49 @@ def run_timm_model(catalog, model_key):
     model = load_timm_model(timm_name)
     print("Model loaded.")
 
-    count = 0
+    entries_to_process = []
     for entry in catalog:
         patch_path = entry.get("patch_path")
         if not patch_path or not os.path.exists(patch_path):
             print(f"[{entry['id']}] No raw patch found. Skipping.")
             continue
-
         out_path = f"{emb_dir}/{entry['id']}.npy"
+        # Always store the embedding path in the entry
+        entry[f"{model_key}_embedding"] = out_path
         if os.path.exists(out_path):
-            print(f"[{entry['id']}] Embedding already exists. Skipping.")
-            count += 1
             continue
+        entries_to_process.append(entry)
 
-        raw_patch = np.load(patch_path)
-        rgb_tensor = prepare_rgb_tensor(raw_patch)
+    if entries_to_process:
+        print(f"Extracting {label} embeddings for {len(entries_to_process)} patches...")
+        from tqdm import tqdm
+        batch_size = 16
+        
+        for i in tqdm(range(0, len(entries_to_process), batch_size), desc=f"{label} Batch Extraction"):
+            batch_entries = entries_to_process[i:i+batch_size]
+            
+            tensors = []
+            for entry in batch_entries:
+                raw_patch = np.load(entry["patch_path"])
+                rgb_tensor = prepare_rgb_tensor(raw_patch)
+                tensors.append(rgb_tensor)
+                
+            batch_x = torch.stack(tensors).to(DEVICE) # (B, 3, H, W)
+            
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
+                    pooled = model(batch_x).cpu().numpy() # (B, embed_dim)
+                    
+            for idx, entry in enumerate(batch_entries):
+                emb = pooled[idx].astype(np.float32)
+                # L2 normalize
+                emb /= np.linalg.norm(emb) + 1e-8
+                out_path = entry[f"{model_key}_embedding"]
+                np.save(out_path, emb)
+    else:
+        print(f"All {label} embeddings already exist.")
 
-        try:
-            embedding = extract_timm_embedding(model, rgb_tensor)
-        except Exception as e:
-            print(f"[{entry['id']}] Inference failed: {e}")
-            continue
-
-        np.save(out_path, embedding)
-        count += 1
-
-        print(f"[{entry['id']}] embedding shape={embedding.shape}, "
-              f"norm={np.linalg.norm(embedding):.3f}")
-
-    print(f"\n{label}: Extracted/cached embeddings for {count} patches in {emb_dir}/")
+    return catalog
 
 
 def main():
@@ -275,12 +305,13 @@ def main():
 
     if model_key == "prithvi":
         updated_catalog = run_prithvi(catalog)
-        # Update the catalog file only for prithvi (backward compat)
-        with open(METADATA_CATALOG_PATH, "w") as f:
-            json.dump(updated_catalog, f, indent=2)
-        print(f"\nExtracted embeddings for {len(updated_catalog)} patches.")
     else:
-        run_timm_model(catalog, model_key)
+        updated_catalog = run_timm_model(catalog, model_key)
+
+    with open(METADATA_CATALOG_PATH, "w") as f:
+        json.dump(updated_catalog, f, indent=2)
+
+    print(f"\nExtracted and updated catalog file saved to {METADATA_CATALOG_PATH}")
 
 
 if __name__ == "__main__":

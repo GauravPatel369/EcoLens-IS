@@ -97,6 +97,25 @@ def normalize(patch, means, stds):
     return normalized.astype(np.float32)
 
 
+def resize_patch_torch(patch_np, target_size=224):
+    import torch
+    import torch.nn.functional as F
+    # patch_np shape: (channels, H, W)
+    t = torch.from_numpy(patch_np).unsqueeze(0) # (1, C, H, W)
+    resized = F.interpolate(t, size=(target_size, target_size), mode='bilinear', align_corners=False)
+    return resized.squeeze(0).numpy()
+
+
+def calculate_offset_coords(lat, lon, dy, dx):
+    import math
+    lat_rad = math.radians(lat)
+    # Latitude offset: 1 degree latitude ~ 110,540 meters
+    d_lat = (dy * 10.0) / 110540.0
+    # Longitude offset: 1 degree longitude ~ 111,320 * cos(lat) meters
+    d_lon = (dx * 10.0) / (111320.0 * math.cos(lat_rad) + 1e-8)
+    return round(lat + d_lat, 6), round(lon + d_lon, 6)
+
+
 def main():
     means, stds = load_prithvi_norm_stats(PRITHVI_CONFIG_PATH)
 
@@ -105,31 +124,88 @@ def main():
     with open(METADATA_CATALOG_PATH) as f:
         catalog = json.load(f)
 
+    # Filter base patches to ensure idempotency (rerun safety)
+    base_entries = []
+    seen_base_ids = set()
+    for entry in catalog:
+        # If ID contains '_p', extract the base ID (e.g. 'forest_001' from 'forest_001_p0')
+        base_id = entry["id"].split("_p")[0]
+        if base_id not in seen_base_ids:
+            seen_base_ids.add(base_id)
+            # Reconstruct clean raw entry path references
+            raw_entry = entry.copy()
+            raw_entry["id"] = base_id
+            raw_entry["patch_path"] = f"patches/{base_id}.npy"
+            base_entries.append(raw_entry)
+
     processed_dir = f"{PATCHES_DIR}_processed"
     os.makedirs(processed_dir, exist_ok=True)
 
     updated_catalog = []
+    crop_size = 160
 
-    for entry in catalog:
-        raw_patch = np.load(entry["patch_path"])
+    print(f"Expanding {len(base_entries)} base patches into 10 deterministic-random sub-crops each (710 total)...")
 
-        clean = handle_nodata(raw_patch)
-        normalized = normalize(clean, means, stds)
+    for entry in base_entries:
+        raw_path = entry["patch_path"]
+        if not os.path.exists(raw_path):
+            print(f"Warning: Raw patch {raw_path} not found. Skipping.")
+            continue
+            
+        raw_patch = np.load(raw_path)
 
-        out_path = f"{processed_dir}/{entry['id']}_processed.npy"
-        np.save(out_path, normalized)
+        # Set deterministic random seed per base patch using its base ID hash
+        h_val = sum(ord(c) for c in entry["id"])
+        rng = np.random.default_rng(h_val)
 
-        entry["processed_path"] = out_path
-        entry["processed_shape"] = list(normalized.shape)
-        updated_catalog.append(entry)
+        # Generate 10 unique offsets (dy, dx) inside [-32, 32]
+        offsets = []
+        while len(offsets) < 10:
+            dy = int(rng.integers(-32, 33))
+            dx = int(rng.integers(-32, 33))
+            if (dy, dx) not in offsets:
+                offsets.append((dy, dx))
 
-        print(f"[{entry['id']}] raw range=({raw_patch.min():.0f}, {raw_patch.max():.0f}) "
-              f"-> normalized range=({normalized.min():.2f}, {normalized.max():.2f})")
+        for idx, (dy, dx) in enumerate(offsets):
+            # Center of the main patch is (112, 112).
+            # The top-left corner of the crop is at (32 + dy, 32 + dx)
+            r = 32 + dy
+            c = 32 + dx
+            
+            crop = raw_patch[:, r:r+crop_size, c:c+crop_size]
+            resized_crop = resize_patch_torch(crop, target_size=224)
+
+            clean = handle_nodata(resized_crop)
+            normalized = normalize(clean, means, stds)
+
+            sub_id = f"{entry['id']}_p{idx}"
+            out_path = f"{processed_dir}/{sub_id}_processed.npy"
+            np.save(out_path, normalized)
+
+            # Offset coordinates physically
+            sub_lat, sub_lon = calculate_offset_coords(entry["lat"], entry["lon"], dy, dx)
+
+            # Create entry duplicate and update sub-crop properties
+            sub_entry = entry.copy()
+            sub_entry["id"] = sub_id
+            sub_entry["lat"] = sub_lat
+            sub_entry["lon"] = sub_lon
+            sub_entry["name"] = f"{entry['name']} (Patch #{idx+1})"
+            sub_entry["processed_path"] = out_path
+            sub_entry["processed_shape"] = list(normalized.shape)
+
+            # Update model-specific path references
+            sub_entry["embedding_path"] = f"embeddings/{sub_id}.npy"
+            sub_entry["prithvi_embedding"] = f"embeddings/{sub_id}.npy"
+            sub_entry["vit_embedding"] = f"embeddings_vit/{sub_id}.npy"
+            sub_entry["resnet_embedding"] = f"embeddings_resnet/{sub_id}.npy"
+
+            updated_catalog.append(sub_entry)
 
     with open(METADATA_CATALOG_PATH, "w") as f:
         json.dump(updated_catalog, f, indent=2)
 
-    print(f"\nProcessed {len(updated_catalog)} patches. Catalog updated.")
+    print(f"\nSuccessfully generated and processed {len(updated_catalog)} sub-crops. Catalog updated.")
 
 
 if __name__ == "__main__":
