@@ -7,3 +7,7 @@ torch
 einops
 timm
 huggingface_hub
+faiss-cpu
+tqdm
+scikit-learn
+pandas

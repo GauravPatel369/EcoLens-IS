@@ -139,7 +139,6 @@ def main():
             print(f"  Failed to extract patch for {loc['id']}: {e}")
             continue
 
-        out_path = f"{PATCHES_DIR}/{loc['id']}.npy"
         np.save(out_path, patch)
         print(f"  Saved patch: {out_path}  shape={patch.shape}")
 

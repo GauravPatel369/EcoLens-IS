@@ -76,7 +76,7 @@ def read_geotiff(file_path: str):
         meta = src.meta
         try:
             coords = src.lnglat()
-        except:
+        except Exception:
             # Cannot read coords
             coords = None
 

@@ -207,7 +207,7 @@ def run_prithvi(catalog):
             batch_x = torch.stack(tensors).to(DEVICE) # (B, C, 1, H, W)
             
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
+                with torch.amp.autocast(device_type=DEVICE, enabled=(DEVICE == "cuda")):
                     # forward_features expects (B, C, T, H, W)
                     latent = model.forward_features(batch_x)[-1] # (B, num_patches+1, embed_dim)
                     patch_tokens = latent[:, 1:, :]
@@ -268,7 +268,7 @@ def run_timm_model(catalog, model_key):
             batch_x = torch.stack(tensors).to(DEVICE) # (B, 3, H, W)
             
             with torch.no_grad():
-                with torch.cuda.amp.autocast(enabled=(DEVICE == "cuda")):
+                with torch.amp.autocast(device_type=DEVICE, enabled=(DEVICE == "cuda")):
                     pooled = model(batch_x).cpu().numpy() # (B, embed_dim)
                     
             for idx, entry in enumerate(batch_entries):

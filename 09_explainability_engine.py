@@ -23,8 +23,12 @@ OUT_EXPLAIN_PATH = f"{RESULTS_DIR}/explainable_retrieval.json"
 
 def get_physical_descriptors(pid, ecosystem, name, lat, lon):
     """
-    Simulates high-resolution physical database queries (ecoregion, elevation, soil type, 
-    LST/temp, precipitation) for the proof-of-concept ecosystem locations.
+    Generates heuristic-based physical descriptors for proof-of-concept purposes.
+
+    WARNING: These values are ESTIMATED using latitude/ecosystem heuristics,
+    NOT queried from real geospatial databases (e.g., SRTM for elevation,
+    WorldClim for climate). For production use, replace with actual API calls
+    to elevation services, climate datasets, and soil classification databases.
     """
     abs_lat = abs(lat)
     

@@ -74,10 +74,15 @@ def compute_model_data(catalog, model_key):
     # Compute similarity matrices for all three methods
     sims_cos, sims_euc, sims_knn = {}, {}, {}
 
+    # Pre-compute L2 norms for safe cosine similarity (in case embeddings aren't pre-normalized)
+    norms = [np.linalg.norm(v) for v in vectors]
+
     for i, id_a in enumerate(ids):
         sims_cos[id_a], sims_euc[id_a], sims_knn[id_a] = {}, {}, {}
         for j, id_b in enumerate(ids):
-            cs = float(np.dot(vectors[i], vectors[j]))
+            # Cosine similarity with explicit normalization
+            norm_product = (norms[i] * norms[j]) + 1e-8
+            cs = float(np.dot(vectors[i], vectors[j]) / norm_product)
             dist = float(np.linalg.norm(vectors[i] - vectors[j]))
             es = 1.0 / (1.0 + dist)
             sims_cos[id_a][id_b] = cs

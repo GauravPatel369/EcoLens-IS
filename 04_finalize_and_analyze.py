@@ -28,8 +28,8 @@ def main():
     with open(METADATA_CATALOG_PATH) as f:
         catalog = json.load(f)
 
-    complete = [e for e in catalog if "embedding_path" in e]
-    incomplete = [e for e in catalog if "embedding_path" not in e]
+    complete = [e for e in catalog if "prithvi_embedding" in e]
+    incomplete = [e for e in catalog if "prithvi_embedding" not in e]
 
     print(f"Catalog status: {len(complete)} complete, {len(incomplete)} incomplete")
     if incomplete:
@@ -43,7 +43,7 @@ def main():
     embeddings = {}
     for entry in complete:
         embeddings[entry["id"]] = {
-            "vector": np.load(entry["embedding_path"]),
+            "vector": np.load(entry["prithvi_embedding"]),
             "ecosystem": entry["ecosystem"],
         }
 

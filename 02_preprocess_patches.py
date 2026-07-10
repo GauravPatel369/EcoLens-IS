@@ -36,6 +36,15 @@ REFLECTANCE_SCALE = 10000.0
 # normalization stats silently produce bad embeddings rather than an
 # obvious error -- exactly the kind of bug that's expensive to catch
 # later in Phase 2 or 3.
+#
+# KNOWN LIMITATION: Prithvi-100M was trained on NASA HLS (Harmonized
+# Landsat-Sentinel) data, which has different radiometric calibration
+# than raw Sentinel-2 L2A imagery used in this pipeline. The HLS
+# data_mean/data_std stats may not perfectly match Sentinel-2 L2A
+# reflectance distributions, causing a subtle normalization mismatch
+# that can degrade embedding quality. For best results, consider:
+#   1. Using HLS data directly via NASA's LP DAAC, or
+#   2. Computing Sentinel-2-specific mean/std from your own patches.
 
 PRITHVI_CONFIG_PATH = "Prithvi_100M_config.yaml"  # download from HF repo
 

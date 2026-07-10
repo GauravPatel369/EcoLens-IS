@@ -34,7 +34,12 @@ def main():
     with open(METADATA_CATALOG_PATH) as f:
         catalog = json.load(f)
 
-    valid_entries = [e for e in catalog if "embedding_path" in e and os.path.exists(e["embedding_path"])]
+    valid_entries = []
+    for e in catalog:
+        emb_path = e.get("prithvi_embedding") or e.get("embedding_path")
+        if emb_path and os.path.exists(emb_path):
+            e["_resolved_embedding_path"] = emb_path
+            valid_entries.append(e)
     if len(valid_entries) < 2:
         print(f"Error: Need at least 2 patches with extracted embeddings. Found {len(valid_entries)}.")
         return
@@ -45,7 +50,7 @@ def main():
     ids = []
     vectors = []
     for entry in valid_entries:
-        vec = np.load(entry["embedding_path"])
+        vec = np.load(entry["_resolved_embedding_path"])
         ids.append(entry["id"])
         vectors.append(vec)
 

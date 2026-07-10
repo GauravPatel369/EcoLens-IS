@@ -148,7 +148,7 @@ PATCH_LOCATIONS = [
     {"id": "agri_004", "ecosystem": "agricultural", "lon": 31.2000, "lat": 29.8000,
      "name": "Nile River Valley Farms, Egypt", "protected_area": False, "climatic_region": "Arid Irrigated"},
     {"id": "agri_005", "ecosystem": "agricultural", "lon": -98.5000, "lat": 38.5000,
-     "name": "Great Plains Wheat Belt, Kansas, USA", "protected_area": False, "climatic_region": "Temperated Semi-Arid"},
+     "name": "Great Plains Wheat Belt, Kansas, USA", "protected_area": False, "climatic_region": "Temperate Semi-Arid"},
     {"id": "agri_006", "ecosystem": "agricultural", "lon": -60.5000, "lat": -34.5000,
      "name": "Pampas Cropland, Argentina", "protected_area": False, "climatic_region": "Humid Subtropical"},
     {"id": "agri_007", "ecosystem": "agricultural", "lon": 104.5000, "lat": 30.5000,

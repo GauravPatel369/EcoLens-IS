@@ -325,7 +325,10 @@ def build_catalog_lookup(all_results):
     for method_name, method_results in all_results.items():
         for query_id, results in method_results.items():
             if query_id not in catalog_lookup:
-                ecosystem = query_id.rsplit("_", 1)[0]
+                # Extract base ID (e.g. 'forest_001' from 'forest_001_p0')
+                base_id = query_id.split("_p")[0]
+                # Extract ecosystem from base ID (everything before the last '_NNN')
+                ecosystem = base_id.rsplit("_", 1)[0]
                 catalog_lookup[query_id] = {
                     "id": query_id,
                     "ecosystem": ecosystem,
