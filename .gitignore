@@ -12,8 +12,8 @@ __pycache__/
 
 # Model checkpoints & configs (large files/downloads)
 Prithvi_100M.pt
-Prithvi_100M_config.yaml
-config.yaml
+# Prithvi_100M_config.yaml
+# config.yaml
 
 # Hugging Face caches
 .cache/
@@ -24,7 +24,7 @@ patches_processed/
 embeddings/
 embeddings_vit/
 embeddings_resnet/
-metadata/catalog.json
+# metadata/catalog.json
 
 # Generated Dashboards
 embedding_dashboard.html
