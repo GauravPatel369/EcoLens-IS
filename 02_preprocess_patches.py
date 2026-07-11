@@ -200,6 +200,10 @@ def main():
             sub_entry["lat"] = sub_lat
             sub_entry["lon"] = sub_lon
             sub_entry["name"] = f"{entry['name']} (Patch #{idx+1})"
+            # Needed so 03_extract_embeddings.py can regenerate the correct
+            # RGB sub-crop for ViT/ResNet instead of reusing the shared base patch
+            sub_entry["crop_offset"] = [dy, dx]
+            sub_entry["crop_size"] = crop_size
             sub_entry["processed_path"] = out_path
             sub_entry["processed_shape"] = list(normalized.shape)
 

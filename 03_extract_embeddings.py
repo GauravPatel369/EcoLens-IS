@@ -128,6 +128,25 @@ def load_timm_model(model_name):
     return model
 
 
+def crop_and_resize_raw(raw_patch, dy, dx, crop_size, target_size=224):
+    """
+    Re-derive the exact same sub-crop that 02_preprocess_patches.py produced
+    for this entry, from the full (shared) base patch array. Mirrors the
+    crop/resize logic in that script so ViT/ResNet see the same sub-patch
+    content as Prithvi does, instead of the full un-cropped base patch.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    r = 32 + dy
+    c = 32 + dx
+    crop = raw_patch[:, r:r + crop_size, c:c + crop_size]
+
+    t = torch.from_numpy(crop).unsqueeze(0)  # (1, C, H, W)
+    resized = F.interpolate(t, size=(target_size, target_size), mode="bilinear", align_corners=False)
+    return resized.squeeze(0).numpy()
+
+
 def prepare_rgb_tensor(raw_patch):
     """
     Prepare a 3-channel (RGB) tensor from a raw 6-band Sentinel-2 patch.
@@ -262,6 +281,14 @@ def run_timm_model(catalog, model_key):
             tensors = []
             for entry in batch_entries:
                 raw_patch = np.load(entry["patch_path"])
+                # IMPORTANT: patch_path points at the shared full base patch --
+                # every sub-crop of a location has the same path. Without this,
+                # ViT/ResNet would extract an identical RGB tensor for all 10
+                # sub-crops of a location instead of the actual unique sub-crop.
+                if "crop_offset" in entry:
+                    dy, dx = entry["crop_offset"]
+                    crop_size = entry.get("crop_size", 160)
+                    raw_patch = crop_and_resize_raw(raw_patch, dy, dx, crop_size)
                 rgb_tensor = prepare_rgb_tensor(raw_patch)
                 tensors.append(rgb_tensor)
                 
