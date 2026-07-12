@@ -163,27 +163,33 @@ def evaluate_method(retrieval_results, catalog_lookup, method_name, k_values):
     for query_id, results in retrieval_results.items():
         query_eco = catalog_lookup[query_id]["ecosystem"]
 
-        # Relevant set: all patches of the same ecosystem (excluding query itself)
-        relevant_set = ecosystem_patches[query_eco] - {query_id}
+        # Extract base ID (e.g. 'forest_001' from 'forest_001_p0')
+        query_base_id = query_id.split("_p")[0]
+        
+        # Relevant set: all patches of the same ecosystem, excluding any patches from the SAME base location
+        relevant_set = {pid for pid in ecosystem_patches[query_eco] if not pid.startswith(query_base_id)}
+        
+        # Filter retrieved results to exclude patches from the same base location
+        filtered_results = [item for item in results if not item["id"].startswith(query_base_id)]
 
         # Compute metrics
-        ap = average_precision(results, relevant_set)
-        rr = reciprocal_rank(results, relevant_set)
+        ap = average_precision(filtered_results, relevant_set)
+        rr = reciprocal_rank(filtered_results, relevant_set)
         all_ap.append(ap)
         all_rr.append(rr)
         category_metrics[query_eco]["ap"].append(ap)
         category_metrics[query_eco]["rr"].append(rr)
 
         for k in k_values:
-            p_at_k = precision_at_k(results, relevant_set, k)
-            r_at_k = recall_at_k(results, relevant_set, k)
+            p_at_k = precision_at_k(filtered_results, relevant_set, k)
+            r_at_k = recall_at_k(filtered_results, relevant_set, k)
             per_k_precision[k].append(p_at_k)
             per_k_recall[k].append(r_at_k)
             category_metrics[query_eco]["precision"][k].append(p_at_k)
             category_metrics[query_eco]["recall"][k].append(r_at_k)
 
         # Confusion matrix (top max_k results)
-        for item in results[:max_k]:
+        for item in filtered_results[:max_k]:
             confusion[query_eco][item["ecosystem"]] += 1
 
     # Aggregate metrics
@@ -206,7 +212,7 @@ def evaluate_method(retrieval_results, catalog_lookup, method_name, k_values):
         cat_result = {
             "ecosystem": eco,
             "num_queries": num_queries,
-            "num_relevant_per_query": len(ecosystem_patches[eco]) - 1,
+            "num_relevant_per_query": len(ecosystem_patches[eco]) - 10,
             "mAP": float(np.mean(cat["ap"])) if cat["ap"] else 0.0,
             "MRR": float(np.mean(cat["rr"])) if cat["rr"] else 0.0,
         }
