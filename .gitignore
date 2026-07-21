@@ -39,3 +39,4 @@ results/
 .DS_Store
 Thumbs.db
 *.log
+hansen_data/

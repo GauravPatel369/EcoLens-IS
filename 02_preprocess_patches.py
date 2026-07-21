@@ -4,9 +4,25 @@ EcoLens Phase 1 -- Step 2: Preprocessing
 Takes raw patches saved by 01_acquire_patches.py and prepares them
 for Prithvi-100M inference:
   - Cast and clip reflectance values
-  - Normalize using Prithvi's expected per-band mean/std
+  - Normalize using custom Sentinel-2-specific per-band mean/std
+    (computed from the acquired patches themselves -- see the
+    "Normalization strategy" comment below for why)
   - Handle missing/nodata pixels
-  - Save as a cleaned tensor ready for model input
+  - Expand each base location into 10 sub-crops via small random
+    offsets (see "KNOWN LIMITATION" comment near the crop loop below)
+
+KNOWN LIMITATION -- sub-crop overlap: the 10 sub-crops generated per
+base location come from offsets within +/-32px of a 160px crop inside
+a 224px canvas, which means adjacent sub-crops of the same location
+overlap by roughly 60-80% of their pixels. This is a deliberate
+tradeoff (it's the only way to get 10 distinct crops out of a single
+224px acquired patch without re-querying the STAC catalog), but it
+means retrieval evaluation must NOT treat two sub-crops of the same
+base location as independent "relevant" matches for each other --
+that measures near-duplicate detection, not ecosystem generalization.
+07_evaluate_retrieval.py's group-aware evaluation mode handles this
+by excluding same-base_id sub-crops from the candidate pool entirely.
+See README.md -> "Evaluation methodology" for the full discussion.
 
 Run:
     python 02_preprocess_patches.py
@@ -15,7 +31,6 @@ Run:
 import json
 import os
 import numpy as np
-import yaml
 
 from config import PATCHES_DIR, METADATA_CATALOG_PATH, PRITHVI_BANDS
 
@@ -23,59 +38,44 @@ from config import PATCHES_DIR, METADATA_CATALOG_PATH, PRITHVI_BANDS
 # i.e. a raw value of 4500 means 0.45 reflectance.
 REFLECTANCE_SCALE = 10000.0
 
-# IMPORTANT: Prithvi-100M's per-band mean/std come from its own training
-# config (data_mean / data_std in the released YAML), not from generic
-# reflectance assumptions. Do NOT hardcode guessed values -- load them
-# directly from the config shipped alongside the model checkpoint:
+# ---------------------------------------------------------------
+# Normalization strategy -- read this before changing it
+# ---------------------------------------------------------------
+# Prithvi-100M was pretrained on NASA HLS (Harmonized Landsat-Sentinel)
+# data with its own released data_mean/data_std (see config.yaml's
+# train_params). HLS and raw Sentinel-2 L2A have different radiometric
+# calibration, so those HLS stats are a mismatched fit for the
+# Sentinel-2 imagery this pipeline actually acquires.
 #
-#   https://huggingface.co/ibm-nasa-geospatial/Prithvi-100M
-#   -> Prithvi_100M_config.yaml  (look for data_mean / data_std)
+# This script deliberately does NOT use Prithvi's HLS stats. Instead,
+# compute_custom_norm_stats() below computes mean/std directly from
+# the acquired Sentinel-2 patches themselves and normalizes with those.
+# This is a domain-adaptation choice, not an oversight -- it keeps the
+# input distribution's scale/center reasonable for a ViT-style encoder
+# even though it isn't the exact distribution Prithvi was pretrained
+# on. It does NOT fully solve the HLS-vs-Sentinel-2 mismatch (the
+# model's learned features were still shaped by HLS statistics during
+# pretraining), so Prithvi's absolute embedding quality on this data
+# should still be interpreted with that caveat -- see README.md's
+# "Known limitations" section for the full discussion, including the
+# separate (and larger) num_frames fix in 03_extract_embeddings.py.
 #
-# Download that file once and point PRITHVI_CONFIG_PATH at it below.
-# This script refuses to fall back to placeholder numbers, because wrong
-# normalization stats silently produce bad embeddings rather than an
-# obvious error -- exactly the kind of bug that's expensive to catch
-# later in Phase 2 or 3.
-#
-# KNOWN LIMITATION: Prithvi-100M was trained on NASA HLS (Harmonized
-# Landsat-Sentinel) data, which has different radiometric calibration
-# than raw Sentinel-2 L2A imagery used in this pipeline. The HLS
-# data_mean/data_std stats may not perfectly match Sentinel-2 L2A
-# reflectance distributions, causing a subtle normalization mismatch
-# that can degrade embedding quality. For best results, consider:
-#   1. Using HLS data directly via NASA's LP DAAC, or
-#   2. Computing Sentinel-2-specific mean/std from your own patches.
-
-PRITHVI_CONFIG_PATH = "Prithvi_100M_config.yaml"  # download from HF repo
+# If you'd rather use Prithvi's original HLS stats for a controlled
+# comparison, load config.yaml's train_params.data_mean/data_std
+# yourself and pass them to normalize() instead of the custom stats
+# below -- but don't silently mix the two approaches across runs.
 
 
-def load_prithvi_norm_stats(config_path):
-    """
-    Load the exact data_mean / data_std arrays Prithvi-100M was trained
-    with, from its own released config file.
-    """
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(
-            f"\n\n  Missing {config_path}.\n"
-            f"  Download it from the Prithvi-100M HuggingFace repo:\n"
-            f"  https://huggingface.co/ibm-nasa-geospatial/Prithvi-100M\n"
-            f"  (file: Prithvi_100M_config.yaml)\n"
-            f"  and place it in this directory before running this script.\n"
-        )
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
-
-    if "train_params" in cfg:
-        means = np.array(cfg["train_params"]["data_mean"], dtype=np.float32)
-        stds = np.array(cfg["train_params"]["data_std"], dtype=np.float32)
-    elif "pretrained_cfg" in cfg:
-        means = np.array(cfg["pretrained_cfg"]["mean"], dtype=np.float32)
-        stds = np.array(cfg["pretrained_cfg"]["std"], dtype=np.float32)
-    else:
-        means = np.array(cfg.get("data_mean", cfg.get("mean")), dtype=np.float32)
-        stds = np.array(cfg.get("data_std", cfg.get("std")), dtype=np.float32)
-
-    return means, stds
+# NOTE: an earlier version of this script had a load_prithvi_norm_stats()
+# function that loaded Prithvi's HLS training stats from a downloaded
+# Prithvi_100M_config.yaml, but main() never actually called it -- it
+# called compute_custom_norm_stats() instead. That left the module
+# docstring and the real behavior contradicting each other. The dead
+# function has been removed; see the block comment above for the
+# actual (and only) normalization path this script uses. If you want
+# Prithvi's original HLS stats for a controlled comparison, load
+# config.yaml's train_params.data_mean/data_std directly -- that file
+# is already part of this project (see config.yaml).
 
 
 def to_reflectance(raw_patch):
@@ -125,11 +125,36 @@ def calculate_offset_coords(lat, lon, dy, dx):
     return round(lat + d_lat, 6), round(lon + d_lon, 6)
 
 
+def compute_custom_norm_stats(base_entries):
+    """
+    Compute mean and std for each of the 6 bands across all available raw patches.
+    Excludes zero (nodata) pixels to prevent skewing stats.
+    """
+    band_values = {b: [] for b in range(6)}
+    for entry in base_entries:
+        raw_path = entry["patch_path"]
+        if os.path.exists(raw_path):
+            patch = np.load(raw_path)
+            patch = np.clip(patch, 0, 10000)
+            for b in range(6):
+                band_data = patch[b].flatten()
+                non_zero = band_data[band_data > 0]
+                if len(non_zero) > 0:
+                    band_values[b].append(non_zero)
+                else:
+                    band_values[b].append(band_data)
+
+    means = []
+    stds = []
+    for b in range(6):
+        all_pixels = np.concatenate(band_values[b])
+        means.append(float(np.mean(all_pixels)))
+        stds.append(float(np.std(all_pixels)))
+        
+    return np.array(means, dtype=np.float32), np.array(stds, dtype=np.float32)
+
+
 def main():
-    means, stds = load_prithvi_norm_stats(PRITHVI_CONFIG_PATH)
-
-    print(f"Loaded Prithvi norm stats -- means: {means}, stds: {stds}")
-
     with open(METADATA_CATALOG_PATH) as f:
         catalog = json.load(f)
 
@@ -146,6 +171,11 @@ def main():
             raw_entry["id"] = base_id
             raw_entry["patch_path"] = f"patches/{base_id}.npy"
             base_entries.append(raw_entry)
+
+    # Compute custom mean/std stats directly from the raw Sentinel-2 patches
+    print("Computing custom mean and standard deviation from acquired Sentinel-2 patches...")
+    means, stds = compute_custom_norm_stats(base_entries)
+    print(f"Calculated Custom Sentinel-2 norm stats -- means: {list(means)}, stds: {list(stds)}")
 
     processed_dir = f"{PATCHES_DIR}_processed"
     os.makedirs(processed_dir, exist_ok=True)
@@ -197,9 +227,16 @@ def main():
             # Create entry duplicate and update sub-crop properties
             sub_entry = entry.copy()
             sub_entry["id"] = sub_id
+            # Store the base location id explicitly rather than relying on
+            # downstream scripts to re-derive it via id.split("_p")[0],
+            # which breaks if an ecosystem/location id ever contains "_p"
+            # itself (audit report Bug #4). This is also what makes
+            # group-aware evaluation in 07_evaluate_retrieval.py reliable.
+            sub_entry["base_id"] = entry["id"]
             sub_entry["lat"] = sub_lat
             sub_entry["lon"] = sub_lon
-            sub_entry["name"] = f"{entry['name']} (Patch #{idx+1})"
+            clean_name = entry["name"].split(" (Patch #")[0]
+            sub_entry["name"] = f"{clean_name} (Patch #{idx+1})"
             # Needed so 03_extract_embeddings.py can regenerate the correct
             # RGB sub-crop for ViT/ResNet instead of reusing the shared base patch
             sub_entry["crop_offset"] = [dy, dx]

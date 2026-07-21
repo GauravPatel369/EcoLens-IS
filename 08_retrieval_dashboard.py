@@ -91,11 +91,15 @@ def compute_model_data(catalog, model_key):
 
     dashboard_data = []
     for i, entry in enumerate(valid):
-        # Determine protected status using naming heuristic
-        name_str = entry.get("name", "").lower()
+        # Use the catalog's real protected_area value directly -- it's
+        # either manually curated (config.py's PATCH_LOCATIONS) or, once
+        # 09_explainability_engine.py has run, backed by a real WDPA
+        # point-in-polygon check. A name-string heuristic ("contains
+        # 'reserve'") was previously used here and produced both false
+        # positives (e.g. a farm literally named "... Reserve Ranch")
+        # and false negatives (real protected areas with no such word in
+        # their name) -- removed rather than patched.
         is_protected = entry.get("protected_area", False)
-        if "national park" in name_str or "reserve" in name_str or "sanctuary" in name_str or "forest reserve" in name_str:
-            is_protected = True
 
         dashboard_data.append({
             "id": entry["id"], 

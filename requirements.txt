@@ -1,13 +1,51 @@
-pystac-client
-planetary-computer
-rasterio
-numpy
-pyyaml
-torch
-einops
-timm
-huggingface_hub
-faiss-cpu
-tqdm
-scikit-learn
-pandas
+# EcoLens -- Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# The original project's requirements.txt (referenced in the audit
+# report but not part of this upload) was missing several packages
+# actually imported by the scripts. This list was built by grepping
+# every `import` statement across 01-11 and config.py/geo_lookups.py,
+# not assumed from memory.
+
+# --- Core scientific stack ---
+numpy>=1.24
+scipy>=1.10                  # scipy.ndimage.distance_transform_edt (10_grid_tiling_labels.py)
+
+# --- Geospatial ---
+rasterio>=1.3                # raster I/O + windowed reads (01, 02, geo_lookups, 10)
+geopandas>=0.14              # WDPA / RESOLVE Ecoregions vector lookups (geo_lookups.py)
+shapely>=2.0                 # point-in-polygon geometry (geo_lookups.py)
+pystac-client>=0.7           # STAC catalog search (01_acquire_patches.py)
+planetary-computer>=1.0      # Microsoft Planetary Computer asset signing (01)
+
+# --- Deep learning / embeddings ---
+torch>=2.1                   # model inference (02, 03) -- install a CUDA build separately
+                              # if you have a GPU; see pytorch.org for the right command
+timm>=0.9                    # ViT-Base / ResNet-50 (03_extract_embeddings.py)
+huggingface_hub>=0.20        # Prithvi-100M checkpoint download (03)
+pyyaml>=6.0                  # config.yaml parsing (03)
+
+# --- Retrieval ---
+faiss-cpu>=1.7               # similarity search index (06_retrieval_engine.py)
+                              # swap for faiss-gpu if you have a CUDA setup and want it
+
+# --- Risk model (Objective 4) ---
+scikit-learn>=1.2            # HistGradientBoostingClassifier needs class_weight support,
+                              # added in 1.2 (11_forest_risk_forecast.py)
+joblib>=1.3                  # model serialization (11)
+
+# --- Dashboards ---
+# 05_create_database_and_dashboard.py uses only numpy (PCA is hand-rolled).
+# 08_retrieval_dashboard.py additionally needs:
+scikit-learn>=1.2            # PCA + TSNE (08_retrieval_dashboard.py) -- already listed above
+
+# --- Utilities ---
+tqdm>=4.65                   # progress bars (01, 03, 06, 09)
+
+# --- Not pinned to exact versions on purpose ---
+# This is a research/proof-of-concept pipeline, not a production
+# service with a locked dependency tree. If you need reproducibility
+# across machines, run `pip freeze > requirements.lock.txt` after a
+# successful install and commit that instead.

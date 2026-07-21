@@ -38,10 +38,33 @@ class EcosystemRetrievalEngine:
     Retrieval engine that indexes ecosystem embeddings using FAISS and supports
     similarity search using multiple measures.
 
-    Supports three methods as defined in the project proposal:
-      - 'cosine'    : Cosine Similarity (via faiss.IndexFlatIP on L2 normalized embeddings)
-      - 'euclidean' : Euclidean Distance (converted to similarity via 1 / (1 + dist))
-      - 'knn'       : k-Nearest Neighbor retrieval (Euclidean distance search via IndexFlatL2)
+    Supports three methods:
+      - 'cosine'    : Cosine Similarity (via faiss.IndexFlatIP on L2-normalized embeddings)
+      - 'euclidean' : Euclidean Distance (via faiss.IndexFlatL2, converted to
+                      similarity via 1 / (1 + dist))
+      - 'knn'       : k-Nearest Neighbor retrieval (Euclidean distance search
+                      via faiss.IndexFlatL2 -- same underlying index as
+                      'euclidean'; kept as a separate named method because
+                      that's how the original retrieval design and the
+                      downstream evaluation/dashboard scripts refer to it)
+
+    IMPORTANT CAVEAT: embeddings produced by 03_extract_embeddings.py are
+    L2-normalized before saving (`emb /= np.linalg.norm(emb) + 1e-8`). For
+    unit-normalized vectors, cosine similarity and Euclidean distance are
+    related by a fixed monotonic transform:
+
+        ||a - b||^2 = 2 - 2 * cos_sim(a, b)
+
+    which means ranking by Euclidean distance and ranking by cosine
+    similarity produce IDENTICAL orderings on these embeddings -- 'cosine',
+    'euclidean', and 'knn' will therefore agree on rank order (their
+    absolute scores differ, but not which items come first). This isn't a
+    bug; it's a real property of comparing normalized vectors, and it's
+    worth stating explicitly rather than presenting three methods as if
+    they were three independent signals. If you want a genuinely different
+    ranking, you'd need an unnormalized embedding space or a different
+    metric entirely (e.g. Mahalanobis distance using the embedding
+    covariance) -- see README.md for discussion.
     """
 
     SUPPORTED_METHODS = ["cosine", "euclidean", "knn"]
@@ -55,20 +78,22 @@ class EcosystemRetrievalEngine:
         self.catalog = {entry["id"]: entry for entry in catalog}
         self.embeddings = embeddings
         self.ids = list(embeddings.keys())
-        
+
         # Build FAISS indices
         # Load and stack all vectors as float32 matrix
         matrix = np.vstack([self.embeddings[pid] for pid in self.ids]).astype(np.float32)
         N, D = matrix.shape
-        
+
         # Verify L2-normalization for Cosine similarity (IndexFlatIP)
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         normalized_matrix = matrix / (norms + 1e-8)
-        
+
         self.index_cos = faiss.IndexFlatIP(D)
         self.index_cos.add(normalized_matrix)
-        
-        # Euclidean index (IndexFlatL2)
+
+        # Raw (unnormalized-as-stored) matrix for Euclidean/kNN search.
+        # See the class docstring for why this produces the same ranking
+        # as cosine on L2-normalized embeddings.
         self.index_l2 = faiss.IndexFlatL2(D)
         self.index_l2.add(matrix)
 
@@ -85,25 +110,23 @@ class EcosystemRetrievalEngine:
         query_vec = self.embeddings[query_id].astype(np.float32).reshape(1, -1)
         N = len(self.ids)
         k_to_search = min(top_k + 1, N)
-        
+
         if method == "cosine":
-            # Normalizing the query vector for cosine search
             q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
-            scores, indices = self.index_cos.search(q_norm, k_to_search)
-            scores = scores[0]
-            indices = indices[0]
-        elif method == "euclidean":
-            # L2 distance search
-            squared_dists, indices = self.index_l2.search(query_vec, k_to_search)
-            dists = np.sqrt(np.clip(squared_dists[0], 0, None))
+            raw_scores, indices = self.index_cos.search(q_norm, k_to_search)
+            raw_scores = raw_scores[0]
+            # Cosine similarity is already in a natural "higher = more similar" scale.
+            scores = raw_scores
+        else:
+            # 'euclidean' and 'knn' both rank by L2 distance via the same index.
+            dists, indices = self.index_l2.search(query_vec, k_to_search)
+            dists = dists[0]
+            # faiss.IndexFlatL2 returns squared L2 distance -- take the
+            # square root to get true Euclidean distance before converting.
+            dists = np.sqrt(np.maximum(dists, 0.0))
             scores = 1.0 / (1.0 + dists)
-            indices = indices[0]
-        elif method == "knn":
-            # Proper kNN: search L2 index for distances
-            squared_dists, indices = self.index_l2.search(query_vec, k_to_search)
-            dists = np.sqrt(np.clip(squared_dists[0], 0, None))
-            scores = dists # we output distance or similarity
-            indices = indices[0]
+
+        indices = indices[0]
 
         results = []
         for i in range(len(indices)):
@@ -113,7 +136,7 @@ class EcosystemRetrievalEngine:
             candidate_id = self.ids[idx]
             if candidate_id == query_id:
                 continue
-                
+
             entry = self.catalog[candidate_id]
             res = {
                 "id": candidate_id,
@@ -125,14 +148,7 @@ class EcosystemRetrievalEngine:
                 "climatic_region": entry.get("climatic_region", "Unknown"),
             }
             
-            if method == "cosine":
-                res["score"] = float(scores[i])
-            elif method == "euclidean":
-                res["score"] = float(scores[i])
-            elif method == "knn":
-                res["distance"] = float(scores[i])
-                res["score"] = 1.0 / (1.0 + float(scores[i])) # similarity mapping
-                
+            res["score"] = float(scores[i])
             results.append(res)
             
         # Add rank

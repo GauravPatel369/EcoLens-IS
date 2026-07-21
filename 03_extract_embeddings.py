@@ -67,13 +67,40 @@ def load_prithvi_model():
     with open(PRITHVI_CONFIG_PATH) as f:
         cfg = yaml.safe_load(f)
 
-    model_args = cfg["model_args"]
+    # IMPORTANT: config.yaml's model_args specifies num_frames=3, because
+    # Prithvi-100M was pretrained on 3-timestep HLS sequences. This
+    # pipeline runs *static* single-scene inference (T=1) -- we don't
+    # have multi-date stacks per patch. If we build the model with
+    # num_frames=3 as-is and then feed it T=1 input (as the previous
+    # version of this function did), the model's temporal patch
+    # embedding / positional embedding are sized for 3 frames while the
+    # actual input has 1, which is a real shape/semantics mismatch, not
+    # just a cosmetic one.
+    #
+    # The fix -- confirmed against IBM/NASA's own official Prithvi-100M
+    # usage example -- is to override num_frames to 1 BEFORE
+    # instantiating the model, so the model is *built* for single-frame
+    # input from the start:
+    #   https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-1.0-100M
+    #   (see the model's own inference notebook / demo code)
+    #
+    # Copy model_args so we never mutate the loaded cfg dict.
+    model_args = dict(cfg["model_args"])
+    model_args["num_frames"] = 1
     model = PrithviMAE(**model_args)
 
     checkpoint = torch.load(PRITHVI_CHECKPOINT_PATH, map_location="cpu")
     state_dict = checkpoint.get("model", checkpoint)
 
-    # Remove pos_embed keys to avoid loading mismatch for fixed/registered buffers
+    # The checkpoint's pos_embed / decoder_pos_embed were trained for
+    # num_frames=3 and are the wrong shape for our num_frames=1 model,
+    # so we drop them from the state dict (strict=False) and let the
+    # freshly-initialized (sinusoidal, non-learned) pos_embed for T=1
+    # apply instead. This is expected, standard practice for this
+    # model family -- Prithvi's positional embeddings are a fixed
+    # sin/cos encoding recomputed from img_size/num_frames, not a
+    # learned parameter, so there is nothing lost by rebuilding it for
+    # the shape we actually use.
     for k in list(state_dict.keys()):
         if "pos_embed" in k:
             del state_dict[k]

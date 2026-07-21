@@ -253,3 +253,83 @@ DEFAULT_MODEL = "prithvi"
 # ImageNet normalization stats (for ViT-Base and ResNet-50)
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+
+# ---------------------------------------------------------------
+# Real geospatial reference data (used by geo_lookups.py)
+#
+# These replace the hash-based fabricated "physical descriptors"
+# that used to live in 09_explainability_engine.py. Every path
+# below is a local file you download ONCE (see README.md ->
+# "Reference data setup" for exact download links/instructions).
+# geo_lookups.py will refuse to fabricate a value if a file is
+# missing -- it returns None for that field and the caller must
+# label it explicitly as unavailable, never guess.
+# ---------------------------------------------------------------
+
+GEO_DATA_DIR = "geo_data"
+
+# WDPA (World Database on Protected Areas), UNEP-WCMC/IUCN.
+# Download the "shapefile" export from protectedplanet.net and point
+# this at the combined polygons layer (merge the 0/1/2 parts first).
+WDPA_POLYGONS_PATH = f"{GEO_DATA_DIR}/WDPA_polygons.shp"
+WDPA_ACCEPTED_STATUSES = ["Designated", "Inscribed", "Established"]  # excludes "Proposed"
+
+# WorldClim v2 bioclim rasters (30 arc-sec), worldclim.org.
+# BIO1 = annual mean temperature (deg C * 10), BIO12 = annual precipitation (mm)
+WORLDCLIM_TEMP_PATH = f"{GEO_DATA_DIR}/wc2.1_30s_bio_1.tif"
+WORLDCLIM_PRECIP_PATH = f"{GEO_DATA_DIR}/wc2.1_30s_bio_12.tif"
+
+# Elevation: SRTM 30m or Copernicus GLO-30 DEM, mosaicked/VRT covering
+# your patch locations.
+DEM_PATH = f"{GEO_DATA_DIR}/dem_mosaic.vrt"
+
+# RESOLVE Ecoregions 2017 (resolve.org/ecoregions), single global shapefile.
+ECOREGIONS_PATH = f"{GEO_DATA_DIR}/Ecoregions2017.shp"
+
+# Local cache of (lat, lon) -> descriptor lookups, to avoid re-sampling
+# the same rasters repeatedly across 700+ sub-crops.
+GEO_LOOKUP_CACHE_PATH = f"{GEO_DATA_DIR}/geo_lookup_cache.json"
+
+# ---------------------------------------------------------------
+# Evaluation methodology
+# ---------------------------------------------------------------
+
+# 02_preprocess_patches.py expands each base location into GROUP_SIZE
+# sub-crops with heavy pixel overlap (see docstring there). Standard
+# per-patch leave-one-out evaluation therefore lets a query retrieve
+# near-duplicate crops of itself, inflating P@1/mAP. GROUP_AWARE_EVAL
+# controls whether 07_evaluate_retrieval.py also computes a
+# leave-one-LOCATION-out variant that excludes all sub-crops sharing
+# a base_id from both the candidate pool and the relevant set. This
+# does not replace the standard ("leaked") metrics -- both are
+# reported side by side so the gap between them is visible.
+GROUP_AWARE_EVAL = True
+
+# ---------------------------------------------------------------
+# Objective 4 -- Forest-Loss Risk Forecasting
+# ---------------------------------------------------------------
+
+# Hansen Global Forest Change (Hansen/UMD/Google/USGS/NASA), tiled
+# GeoTIFFs, public GCS bucket, no auth required:
+#   https://storage.googleapis.com/earthenginepartners-hansen/GFC-<version>/<layer>_<lat>_<lon>.tif
+HANSEN_DATA_DIR = "hansen_data"
+HANSEN_VERSION = "GFC-2023-v1.11"
+HANSEN_BASE_URL = f"https://storage.googleapis.com/earthenginepartners-hansen/{HANSEN_VERSION}"
+# Minimum canopy cover (%) in Hansen's "treecover2000" layer for a
+# pixel to count as forest at baseline -- standard literature default.
+HANSEN_TREECOVER_THRESHOLD = 30
+
+# Grid-tiling for risk modeling: forest-type base locations are tiled
+# into GRID_CELL_SIZE_M x GRID_CELL_SIZE_M cells so the model trains
+# on hundreds-to-thousands of independent cell-year samples instead
+# of ~30-45 named locations (see README.md -> "Sample size").
+GRID_CELL_SIZE_M = 1000          # 1km cells, matched to WorldClim resolution
+GRID_REGION_BUFFER_KM = 15       # radius around each base location to tile
+RISK_FOREST_ECOSYSTEMS = ["forest", "mangrove"]
+
+# Prediction target: was there tree-cover loss within this many years
+# after the observation year, in a Hansen-labeled cell.
+RISK_HORIZON_YEARS = 2
+RISK_MODEL_DIR = "risk_model"
+RISK_FEATURES_PATH = f"{RISK_MODEL_DIR}/cell_year_features.csv"
+RISK_MODEL_PATH = f"{RISK_MODEL_DIR}/forest_loss_risk_model.joblib"
