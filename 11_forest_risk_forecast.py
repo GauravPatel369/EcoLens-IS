@@ -297,10 +297,99 @@ def predict_risk(lon, lat, model_path=RISK_MODEL_PATH):
     return risk
 
 
+def run_spatial_holdout(rows, feature_names=DRIVER_FEATURES):
+    """
+    Perform a leave-one-location-out spatial holdout validation.
+    For each unique region_id, trains a model on all other regions
+    and evaluates on the held-out region.
+    """
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.metrics import average_precision_score, roc_auc_score
+
+    regions = sorted(list(set(row["region_id"] for row in rows)))
+
+    print(f"\n{'='*70}")
+    print("SPATIAL HOLDOUT (leave-one-location-out)")
+    print(f"{'='*70}")
+
+    y_all = np.array([int(r[TARGET_COLUMN]) for r in rows], dtype=np.int32)
+    base_pos_rate = float(y_all.mean())
+
+    print(f"  {len(regions)} regions, {len(rows)} total samples, base positive rate: {base_pos_rate:.4f}")
+    print("  Training a fresh model per fold -- this takes a while (~15x a single training run).\n")
+
+    results = []
+
+    for held_out in regions:
+        train_rows = [r for r in rows if r["region_id"] != held_out]
+        test_rows = [r for r in rows if r["region_id"] == held_out]
+
+        X_train, y_train, _ = build_matrix(train_rows, feature_names)
+        X_test, y_test, _ = build_matrix(test_rows, feature_names)
+
+        valid_indices = []
+        for j, feat in enumerate(feature_names):
+            col_train = X_train[:, j]
+            non_nan = col_train[~np.isnan(col_train)]
+            if len(np.unique(non_nan)) >= 2:
+                valid_indices.append(j)
+
+        X_train_active = X_train[:, valid_indices]
+        X_test_active = X_test[:, valid_indices]
+
+        model = HistGradientBoostingClassifier(random_state=42, max_iter=100)
+        model.fit(X_train_active, y_train)
+
+        y_scores = model.predict_proba(X_test_active)[:, 1]
+
+        ap = average_precision_score(y_test, y_scores)
+        try:
+            roc_auc = roc_auc_score(y_test, y_scores)
+        except ValueError:
+            roc_auc = np.nan
+
+        pos_test = int(y_test.sum())
+        print(f"  [held out: {held_out}] AP={ap:.4f}  ROC-AUC={roc_auc:.4f}  "
+              f"(train={len(y_train)}, test={len(y_test)}, pos_test={pos_test})")
+
+        results.append({
+            "region": held_out,
+            "ap": ap,
+            "roc_auc": roc_auc,
+            "n": len(y_test),
+            "pos": pos_test
+        })
+
+    print(f"\n{'='*70}")
+    print("SPATIAL HOLDOUT SUMMARY")
+    print(f"{'='*70}")
+    print(f"  Folds completed: {len(regions)}/{len(regions)}")
+    mean_ap = np.mean([r["ap"] for r in results])
+    std_ap = np.std([r["ap"] for r in results])
+    print(f"  Mean PR-AUC across held-out regions: {mean_ap:.4f}  (+/- {std_ap:.4f} std)")
+    print(f"  Base positive rate (no-skill baseline): {base_pos_rate:.4f}\n")
+
+    print("  Per-region results, worst to best:")
+    sorted_results = sorted(results, key=lambda x: x["ap"])
+    for r in sorted_results:
+        print(f"    {r['region']:<20} AP={r['ap']:.4f}  ROC-AUC={r['roc_auc']:.4f}  (n={r['n']}, pos={r['pos']})")
+
+    print(f"\n{'='*70}")
+    print("INTERPRETATION")
+    print(f"{'='*70}")
+    print(f"  Mean spatial-holdout PR-AUC ({mean_ap:.4f}) is {'meaningfully above' if mean_ap > base_pos_rate + 0.02 else 'close to'} the base")
+    print(f"  rate ({base_pos_rate:.4f}) -- the model shows {'real' if mean_ap > base_pos_rate + 0.02 else 'limited'} signal even on locations")
+    print("  it never trained on. Still worth checking the per-region breakdown above:")
+    print("  a few strong locations can pull the mean up while most others sit near")
+    print("  baseline, which the mean alone won't show you.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="EcoLens Step 11: Forest-Loss Risk Forecasting")
     parser.add_argument("--predict", nargs=2, type=float, metavar=("LON", "LAT"),
                          help="Score a single point instead of training.")
+    parser.add_argument("--spatial-holdout", action="store_true",
+                         help="Run leave-one-location-out spatial holdout validation.")
     parser.add_argument("--train-cutoff-year", type=int, default=None,
                          help="Last obs_year included in training (default: computed as an "
                               "80/20-ish split over the available years).")
@@ -309,6 +398,11 @@ def main():
     if args.predict:
         lon, lat = args.predict
         predict_risk(lon, lat)
+        return
+
+    if args.spatial_holdout:
+        rows = load_features()
+        run_spatial_holdout(rows)
         return
 
     print(f"\n{'='*70}")
