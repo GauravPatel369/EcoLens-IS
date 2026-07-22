@@ -180,6 +180,8 @@ def evaluate_method(retrieval_results, catalog_lookup, method_name, k_values, gr
         for k in k_values:
             p_at_k = precision_at_k(filtered_results, relevant_set, k)
             r_at_k = recall_at_k(filtered_results, relevant_set, k)
+            p_at_k = precision_at_k(filtered_results, relevant_set, k)
+            r_at_k = recall_at_k(filtered_results, relevant_set, k)
             per_k_precision[k].append(p_at_k)
             per_k_recall[k].append(r_at_k)
             category_metrics[query_eco]["precision"][k].append(p_at_k)
