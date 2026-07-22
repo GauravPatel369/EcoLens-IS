@@ -241,10 +241,51 @@ def sample_raster_point(raster_path, lon, lat, window=1, nodata_override=None):
         else:
             valid = window_data.flatten()
 
-        if valid.size == 0:
-            return None
-
         return float(np.mean(valid))
+
+
+def sample_raster_point_stats(raster_path, lon, lat, window=3, nodata_override=None):
+    """
+    Sample a raster at (lon, lat) EPSG:4326, returning both the mean
+    and standard deviation (ruggedness proxy) over an NxN window.
+    """
+    if not os.path.exists(raster_path):
+        return None, None
+
+    import rasterio
+    from rasterio.warp import transform as warp_transform
+
+    with rasterio.open(raster_path) as src:
+        if src.crs is not None and str(src.crs) != _target_crs():
+            xs, ys = warp_transform(_target_crs(), src.crs, [lon], [lat])
+            x, y = xs[0], ys[0]
+        else:
+            x, y = lon, lat
+
+        row, col = src.index(x, y)
+
+        half = window // 2
+        row0, row1 = max(0, row - half), min(src.height, row + half + 1)
+        col0, col1 = max(0, col - half), min(src.width, col + half + 1)
+        if row1 <= row0 or col1 <= col0:
+            return None, None
+
+        window_data = src.read(
+            1,
+            window=rasterio.windows.Window(col0, row0, col1 - col0, row1 - row0),
+        ).astype(np.float64)
+
+        nodata = nodata_override if nodata_override is not None else src.nodata
+        if nodata is not None:
+            valid = window_data[window_data != nodata]
+        else:
+            valid = window_data.flatten()
+
+        if valid.size == 0:
+            return None, None
+
+        return float(np.mean(valid)), float(np.std(valid))
+
 
 
 # ---------------------------------------------------------------
@@ -332,6 +373,17 @@ def _dem_tile_path(lon, lat):
     return os.path.join(DEM_TILES_DIR, f"{tile_name}.tif")
 
 
+def get_elevation_and_ruggedness(lon, lat):
+    """
+    Real elevation and ruggedness (elevation standard deviation in meters)
+    from SRTM/Copernicus DEM.
+    """
+    tile_path = _dem_tile_path(lon, lat)
+    if not os.path.exists(tile_path):
+        return None, None
+    return sample_raster_point_stats(tile_path, lon, lat, window=3)
+
+
 def get_elevation(lon, lat):
     """
     Real elevation (meters) from SRTM/Copernicus DEM, averaged over a
@@ -350,10 +402,8 @@ def get_elevation(lon, lat):
     or a query point near a tile boundary that happens to fall in a
     neighboring tile you don't have).
     """
-    tile_path = _dem_tile_path(lon, lat)
-    if not os.path.exists(tile_path):
-        return None
-    return sample_raster_point(tile_path, lon, lat, window=3)
+    elev, _ = get_elevation_and_ruggedness(lon, lat)
+    return elev
 
 
 def get_ecoregion(lon, lat):
@@ -412,17 +462,18 @@ def get_physical_descriptors(lon, lat, use_cache=True):
         # through and recompute instead.
         sources = [cached.get("climate_source"), cached.get("elevation_source"),
                    cached.get("ecoregion_source"), cached.get("protection_source")]
-        if "unavailable" not in sources:
+        if "unavailable" not in sources and "ruggedness_m" in cached:
             return cached
         # else: fall through and recompute -- don't return the stale entry
 
     temp, rainfall = get_climate(lon, lat)
-    elevation = get_elevation(lon, lat)
+    elevation, ruggedness = get_elevation_and_ruggedness(lon, lat)
     eco_name, biome_name = get_ecoregion(lon, lat)
     protected = is_protected(lon, lat)
 
     result = {
         "elevation_m": round(elevation, 1) if elevation is not None else None,
+        "ruggedness_m": round(ruggedness, 1) if ruggedness is not None else None,
         "temp_c": round(temp, 1) if temp is not None else None,
         "rainfall_mm": round(rainfall, 1) if rainfall is not None else None,
         "ecoregion": eco_name,

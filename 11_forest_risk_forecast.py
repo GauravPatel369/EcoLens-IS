@@ -70,6 +70,7 @@ DRIVER_FEATURES = [
     "temp_c",
     "rainfall_mm",
     "elevation_m",
+    "ruggedness_m",
     "obs_year",
 ]
 OPTIONAL_FEATURES = ["embedding_drift"]
@@ -275,6 +276,7 @@ def predict_risk(lon, lat, model_path=RISK_MODEL_PATH):
         "temp_c": geo["temp_c"],
         "rainfall_mm": geo["rainfall_mm"],
         "elevation_m": geo["elevation_m"],
+        "ruggedness_m": geo["ruggedness_m"],
         "obs_year": current_year,
     }
 

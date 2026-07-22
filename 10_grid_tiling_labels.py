@@ -378,6 +378,7 @@ def main():
                         "temp_c": geo["temp_c"],
                         "rainfall_mm": geo["rainfall_mm"],
                         "elevation_m": geo["elevation_m"],
+                        "ruggedness_m": geo["ruggedness_m"],
                         "label_loss_within_horizon": result["label_loss_within_horizon"],
                     })
 
