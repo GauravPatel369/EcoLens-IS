@@ -32,9 +32,13 @@ REFERENCE DATA SETUP (one-time, see README.md for full instructions)
    _fix_worldclim_temp_scale).
 
 3. Elevation -- SRTM 30m (earthexplorer.usgs.gov) or Copernicus
-   GLO-30 DEM (registry.opendata.aws/copernicus-dem). Mosaic the
-   tiles covering your patch locations into a single VRT/GeoTIFF at
-   config.DEM_PATH.
+   GLO-30 DEM (registry.opendata.aws/copernicus-dem). Download the
+   1x1 degree tiles covering your patch locations and place them,
+   UNMOSAICKED, in config.DEM_TILES_DIR -- get_elevation() looks up
+   the correct tile per query point on demand. Do NOT try to mosaic
+   worldwide-scattered tiles into one file: that means allocating a
+   raster covering their full combined bounding box, which for this
+   project's global locations is most of the planet.
 
 4. RESOLVE Ecoregions 2017 -- resolve.org/ecoregions
    Single global shapefile, save to config.ECOREGIONS_PATH.
@@ -52,7 +56,7 @@ import numpy as np
 from config import (
     WDPA_POLYGONS_PATH, WDPA_ACCEPTED_STATUSES,
     WORLDCLIM_TEMP_PATH, WORLDCLIM_PRECIP_PATH,
-    DEM_PATH, ECOREGIONS_PATH, GEO_LOOKUP_CACHE_PATH,
+    DEM_TILES_DIR, ECOREGIONS_PATH, GEO_LOOKUP_CACHE_PATH,
 )
 
 
@@ -310,13 +314,46 @@ def get_climate(lon, lat):
     return temp, rainfall
 
 
+def _dem_tile_path(lon, lat):
+    """
+    Locate the Copernicus DEM GLO-30 tile file covering (lon, lat),
+    using the same 1x1-degree, southwest-corner naming convention as
+    download_reference_data.py's _dem_tile_name() (verified against
+    AWS's own tile listing). Returns the local path whether or not
+    the file actually exists -- callers check existence themselves,
+    consistent with every other lookup in this module never assuming
+    data is present.
+    """
+    lat_tile = int(lat // 1)
+    lon_tile = int(lon // 1)
+    ns = "N" if lat_tile >= 0 else "S"
+    ew = "E" if lon_tile >= 0 else "W"
+    tile_name = f"Copernicus_DSM_COG_10_{ns}{abs(lat_tile):02d}_00_{ew}{abs(lon_tile):03d}_00_DEM"
+    return os.path.join(DEM_TILES_DIR, f"{tile_name}.tif")
+
+
 def get_elevation(lon, lat):
     """
     Real elevation (meters) from SRTM/Copernicus DEM, averaged over a
     3x3 pixel window (~90m at SRTM 30m resolution) to reduce
     sensitivity to a single noisy pixel on sloped terrain.
+
+    Looks up the single 1x1 degree tile covering this point rather
+    than reading from a pre-built mosaic -- see DEM_TILES_DIR's
+    comment in config.py for why: this project's locations are
+    scattered worldwide, and mosaicking globally-scattered tiles into
+    one dense raster means allocating an array covering their full
+    combined bounding box, which is most of the planet.
+
+    Returns None if the tile covering this point hasn't been
+    downloaded (e.g. a location outside your original download list,
+    or a query point near a tile boundary that happens to fall in a
+    neighboring tile you don't have).
     """
-    return sample_raster_point(DEM_PATH, lon, lat, window=3)
+    tile_path = _dem_tile_path(lon, lat)
+    if not os.path.exists(tile_path):
+        return None
+    return sample_raster_point(tile_path, lon, lat, window=3)
 
 
 def get_ecoregion(lon, lat):
@@ -362,7 +399,22 @@ def get_physical_descriptors(lon, lat, use_cache=True):
     cache = _load_cache() if use_cache else {}
     key = _cache_key(lon, lat)
     if use_cache and key in cache:
-        return cache[key]
+        cached = cache[key]
+        # Only trust a cached result if it was fully resolved when it was
+        # written. A result cached back when reference data wasn't
+        # downloaded yet has "unavailable" sources -- returning that
+        # forever, even after the real data shows up, is exactly the bug
+        # that happened in practice: 09/10 ran once before the WDPA/
+        # WorldClim/DEM downloads completed, cached all-None results for
+        # every location, and every run after that silently returned the
+        # same stale nulls even though the real data was sitting right
+        # there. So: incomplete cache entries are NOT trusted -- fall
+        # through and recompute instead.
+        sources = [cached.get("climate_source"), cached.get("elevation_source"),
+                   cached.get("ecoregion_source"), cached.get("protection_source")]
+        if "unavailable" not in sources:
+            return cached
+        # else: fall through and recompute -- don't return the stale entry
 
     temp, rainfall = get_climate(lon, lat)
     elevation = get_elevation(lon, lat)
@@ -382,7 +434,12 @@ def get_physical_descriptors(lon, lat, use_cache=True):
         "protection_source": "WDPA" if protected is not None else "unavailable",
     }
 
-    if use_cache:
+    # Only persist fully-resolved results (see the comment above for why
+    # partial/unavailable results deliberately aren't cached -- they need
+    # to keep retrying until the reference data behind them exists).
+    sources = [result["climate_source"], result["elevation_source"],
+               result["ecoregion_source"], result["protection_source"]]
+    if use_cache and "unavailable" not in sources:
         cache[key] = result
         _save_cache()
 

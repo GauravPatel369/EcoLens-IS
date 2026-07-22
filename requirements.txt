@@ -41,6 +41,10 @@ joblib>=1.3                  # model serialization (11)
 # 08_retrieval_dashboard.py additionally needs:
 scikit-learn>=1.2            # PCA + TSNE (08_retrieval_dashboard.py) -- already listed above
 
+# --- Reference data download (download_reference_data.py) ---
+requests>=2.31              # RESOLVE Ecoregions / WorldClim direct downloads
+boto3>=1.28                 # Copernicus DEM GLO-30 (anonymous S3 access)
+
 # --- Utilities ---
 tqdm>=4.65                   # progress bars (01, 03, 06, 09)
 

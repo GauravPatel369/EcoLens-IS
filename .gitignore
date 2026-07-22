@@ -40,3 +40,5 @@ results/
 Thumbs.db
 *.log
 hansen_data/
+geo_data/
+risk_model

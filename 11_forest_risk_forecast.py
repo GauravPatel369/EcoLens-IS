@@ -163,15 +163,38 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
         print(f"  observation-year range in 10_grid_tiling_labels.py, then rerun.")
         return None
 
+    # Filter out feature columns that have fewer than 2 distinct non-NaN values in X_train
+    # (e.g. constant columns or all-NaN columns when optional reference data is missing).
+    valid_indices = []
+    skipped = []
+    for j, feat in enumerate(feature_names):
+        col_train = X_train[:, j]
+        non_nan = col_train[~np.isnan(col_train)]
+        if len(np.unique(non_nan)) >= 2:
+            valid_indices.append(j)
+        else:
+            skipped.append(feat)
+
+    if skipped:
+        print(f"  Skipped constant/uninformative feature(s) (<2 distinct values in train set): {skipped}")
+
+    if not valid_indices:
+        print("  WARNING: No feature has enough distinct values to train a model.")
+        return None
+
+    active_feature_names = [feature_names[i] for i in valid_indices]
+    X_train_active = X_train[:, valid_indices]
+    X_test_active = X_test[:, valid_indices]
+
     model = HistGradientBoostingClassifier(
         class_weight="balanced",  # loss events are rare; don't let the
                                     # majority (no-loss) class dominate
         max_depth=6,
         random_state=42,
     )
-    model.fit(X_train, y_train)
+    model.fit(X_train_active, y_train)
 
-    y_scores = model.predict_proba(X_test)[:, 1]
+    y_scores = model.predict_proba(X_test_active)[:, 1]
     ap = average_precision_score(y_test, y_scores)
     try:
         roc_auc = roc_auc_score(y_test, y_scores)
@@ -193,17 +216,17 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
     # Permutation importance (HistGradientBoostingClassifier has no
     # built-in feature_importances_, unlike tree-bagging models).
     try:
-        result = permutation_importance(model, X_test, y_test, n_repeats=10,
+        result = permutation_importance(model, X_test_active, y_test, n_repeats=10,
                                          random_state=42, scoring="average_precision")
         print(f"\n  Feature importance (permutation, drop in PR-AUC when shuffled):")
         order = np.argsort(result.importances_mean)[::-1]
         for idx in order:
-            print(f"    {feature_names[idx]:<28} {result.importances_mean[idx]:+.4f} "
+            print(f"    {active_feature_names[idx]:<28} {result.importances_mean[idx]:+.4f} "
                   f"(+/- {result.importances_std[idx]:.4f})")
     except Exception as e:
         print(f"  (permutation importance skipped: {e})")
 
-    return {"model": model, "ap": ap, "roc_auc": roc_auc, "feature_names": feature_names}
+    return {"model": model, "ap": ap, "roc_auc": roc_auc, "feature_names": active_feature_names}
 
 
 def predict_risk(lon, lat, model_path=RISK_MODEL_PATH):
@@ -316,7 +339,7 @@ def main():
     driver_result = train_and_evaluate(X_train, y_train, X_test, y_test, DRIVER_FEATURES, "Driver features only")
 
     best_result = driver_result
-    best_features = DRIVER_FEATURES
+    best_features = driver_result["feature_names"] if driver_result else None
 
     # --- Driver + embedding-drift model (only if the column is real) ---
     if has_embedding_drift and driver_result is not None:
@@ -335,7 +358,7 @@ def main():
             print(f"  Delta: {delta:+.4f}  "
                   f"({'embedding drift adds predictive power' if delta > 0.01 else 'no clear improvement from embedding drift'})")
             if drift_result["ap"] >= driver_result["ap"]:
-                best_result, best_features = drift_result, feats_with_drift
+                best_result, best_features = drift_result, drift_result["feature_names"]
 
     if best_result is None:
         print("\nNo model could be trained -- see warnings above. Not saving a model file.")

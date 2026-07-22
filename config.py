@@ -281,7 +281,17 @@ WORLDCLIM_PRECIP_PATH = f"{GEO_DATA_DIR}/wc2.1_30s_bio_12.tif"
 
 # Elevation: SRTM 30m or Copernicus GLO-30 DEM, mosaicked/VRT covering
 # your patch locations.
-DEM_PATH = f"{GEO_DATA_DIR}/dem_mosaic.vrt"
+# Elevation: SRTM 30m or Copernicus GLO-30 DEM. Tiles are looked up
+# per-point on demand (same pattern as Hansen tiles in
+# 10_grid_tiling_labels.py) rather than mosaicked into one file --
+# this project's locations are scattered worldwide, and mosaicking
+# globally-scattered 1x1 degree tiles into a single dense array means
+# allocating a raster covering the full combined bounding box, which
+# for worldwide points is most of the planet (a multi-terabyte
+# allocation in practice -- this is what a real run hit). Keep the
+# downloaded tiles in DEM_TILES_DIR; geo_lookups.py finds the right
+# one per query point by filename convention.
+DEM_TILES_DIR = f"{GEO_DATA_DIR}/dem_tiles"
 
 # RESOLVE Ecoregions 2017 (resolve.org/ecoregions), single global shapefile.
 ECOREGIONS_PATH = f"{GEO_DATA_DIR}/Ecoregions2017.shp"
@@ -325,7 +335,7 @@ HANSEN_TREECOVER_THRESHOLD = 30
 # of ~30-45 named locations (see README.md -> "Sample size").
 GRID_CELL_SIZE_M = 1000          # 1km cells, matched to WorldClim resolution
 GRID_REGION_BUFFER_KM = 15       # radius around each base location to tile
-RISK_FOREST_ECOSYSTEMS = ["forest", "mangrove"]
+RISK_FOREST_ECOSYSTEMS = ["forest"]
 
 # Prediction target: was there tree-cover loss within this many years
 # after the observation year, in a Hansen-labeled cell.

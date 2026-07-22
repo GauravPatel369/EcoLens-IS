@@ -262,17 +262,19 @@ def main():
     # Upfront, honest check of what real reference data is actually
     # available -- so the run tells you what's real vs. missing before
     # you've generated 700+ explanations, not after.
-    from config import WDPA_POLYGONS_PATH, WORLDCLIM_TEMP_PATH, WORLDCLIM_PRECIP_PATH, DEM_PATH, ECOREGIONS_PATH
+    from config import WDPA_POLYGONS_PATH, WORLDCLIM_TEMP_PATH, WORLDCLIM_PRECIP_PATH, DEM_TILES_DIR, ECOREGIONS_PATH
     print("Reference dataset availability:")
     for label, path in [
         ("WDPA (protected areas)", WDPA_POLYGONS_PATH),
         ("WorldClim temperature", WORLDCLIM_TEMP_PATH),
         ("WorldClim precipitation", WORLDCLIM_PRECIP_PATH),
-        ("DEM (elevation)", DEM_PATH),
         ("RESOLVE Ecoregions", ECOREGIONS_PATH),
     ]:
         status = "found" if os.path.exists(path) else "MISSING -- fields depending on this will be null"
         print(f"    {label:<28} {path:<40} {status}")
+    n_dem_tiles = len(os.listdir(DEM_TILES_DIR)) if os.path.isdir(DEM_TILES_DIR) else 0
+    dem_status = f"{n_dem_tiles} tile(s) found" if n_dem_tiles else "MISSING -- elevation will be null"
+    print(f"    {'DEM (elevation)':<28} {DEM_TILES_DIR:<40} {dem_status}")
     print()
 
     # 1. Compute descriptors for all patches
