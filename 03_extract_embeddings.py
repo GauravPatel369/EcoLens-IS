@@ -131,7 +131,8 @@ def extract_embedding(model, patch_tensor):
     x = x.unsqueeze(2)                   # add time dim  -> (1, C, 1, H, W)
     x = x.to(DEVICE)
 
-    latent = model.forward_features(x)[-1]
+    # Retrieve output from Block 8 (index -4) for optimal semantic features
+    latent = model.forward_features(x)[-4]
 
     # latent shape: (1, num_patches + 1, embed_dim) -- index 0 is CLS token
     patch_tokens = latent[:, 1:, :]
@@ -254,8 +255,8 @@ def run_prithvi(catalog):
             
             with torch.no_grad():
                 with torch.amp.autocast(device_type=DEVICE, enabled=(DEVICE == "cuda")):
-                    # forward_features expects (B, C, T, H, W)
-                    latent = model.forward_features(batch_x)[-1] # (B, num_patches+1, embed_dim)
+                    # Retrieve output from Block 8 (index -4) for optimal semantic features
+                    latent = model.forward_features(batch_x)[-4] # (B, num_patches+1, embed_dim)
                     patch_tokens = latent[:, 1:, :]
                     pooled = patch_tokens.mean(dim=1).cpu().numpy() # (B, embed_dim)
                     
