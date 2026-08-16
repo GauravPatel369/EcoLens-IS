@@ -1,10 +1,11 @@
 """
 EcoLens Objective 2 - Step 6: Ecosystem Similarity Retrieval Engine
 
-Implements the core retrieval framework using three similarity measures:
+Implements the core retrieval framework using four similarity measures:
   - Cosine Similarity
   - Euclidean Distance (converted to similarity)
   - k-Nearest Neighbor (kNN) retrieval
+  - Approximate Nearest Neighbor (ANN) retrieval via HNSW
 
 Supports multiple foundation models via --model flag:
   prithvi, vit, resnet
@@ -18,6 +19,8 @@ Run:
 import argparse
 import json
 import os
+import resource
+import time
 import numpy as np
 import faiss
 from tqdm import tqdm
@@ -38,7 +41,7 @@ class EcosystemRetrievalEngine:
     Retrieval engine that indexes ecosystem embeddings using FAISS and supports
     similarity search using multiple measures.
 
-    Supports three methods:
+    Supports four methods:
       - 'cosine'    : Cosine Similarity (via faiss.IndexFlatIP on L2-normalized embeddings)
       - 'euclidean' : Euclidean Distance (via faiss.IndexFlatL2, converted to
                       similarity via 1 / (1 + dist))
@@ -47,9 +50,26 @@ class EcosystemRetrievalEngine:
                       'euclidean'; kept as a separate named method because
                       that's how the original retrieval design and the
                       downstream evaluation/dashboard scripts refer to it)
+      - 'ann'       : Approximate Nearest Neighbor retrieval via
+                      faiss.IndexHNSWFlat (Hierarchical Navigable Small
+                      World graph search on cosine/inner-product space).
+                      Unlike 'euclidean'/'knn' below, this is a genuinely
+                      different retrieval STRATEGY, not just a different
+                      distance formula on the same exact search -- HNSW
+                      approximates the neighbor graph, so its ranking can
+                      (and sometimes does) diverge from the exact methods,
+                      trading a small recall loss for sub-linear query time
+                      at scale. At this project's dataset size (~700
+                      patches) the speed difference is not the point; it's
+                      here to answer the faculty review comment asking for
+                      cosine/Euclidean/ANN to be investigated as genuinely
+                      distinct retrieval strategies, not to solve a
+                      performance problem that doesn't exist yet at this
+                      scale.
 
-    IMPORTANT CAVEAT: embeddings produced by 03_extract_embeddings.py are
-    L2-normalized before saving (`emb /= np.linalg.norm(emb) + 1e-8`). For
+    IMPORTANT CAVEAT (applies to 'cosine' / 'euclidean' / 'knn' only):
+    embeddings produced by 03_extract_embeddings.py are L2-normalized
+    before saving (`emb /= np.linalg.norm(emb) + 1e-8`). For
     unit-normalized vectors, cosine similarity and Euclidean distance are
     related by a fixed monotonic transform:
 
@@ -61,13 +81,15 @@ class EcosystemRetrievalEngine:
     absolute scores differ, but not which items come first). This isn't a
     bug; it's a real property of comparing normalized vectors, and it's
     worth stating explicitly rather than presenting three methods as if
-    they were three independent signals. If you want a genuinely different
-    ranking, you'd need an unnormalized embedding space or a different
-    metric entirely (e.g. Mahalanobis distance using the embedding
-    covariance) -- see README.md for discussion.
+    they were three independent signals. 'ann' is the one method here that
+    is NOT guaranteed to agree with the other three, precisely because it
+    searches an approximate graph rather than the exact index.
     """
 
-    SUPPORTED_METHODS = ["cosine", "euclidean", "knn"]
+    SUPPORTED_METHODS = ["cosine", "euclidean", "knn", "ann"]
+    HNSW_M = 32               # neighbors per node in the HNSW graph
+    HNSW_EF_CONSTRUCTION = 40
+    HNSW_EF_SEARCH = 32
 
     def __init__(self, catalog, embeddings):
         """
@@ -97,6 +119,15 @@ class EcosystemRetrievalEngine:
         self.index_l2 = faiss.IndexFlatL2(D)
         self.index_l2.add(matrix)
 
+        # Approximate index: HNSW graph over the SAME normalized vectors
+        # cosine search uses (inner product on unit vectors = cosine
+        # similarity), so any divergence from 'cosine' below is genuinely
+        # from the approximate graph search, not from a different metric.
+        self.index_ann = faiss.IndexHNSWFlat(D, self.HNSW_M, faiss.METRIC_INNER_PRODUCT)
+        self.index_ann.hnsw.efConstruction = self.HNSW_EF_CONSTRUCTION
+        self.index_ann.hnsw.efSearch = self.HNSW_EF_SEARCH
+        self.index_ann.add(normalized_matrix)
+
     def search(self, query_id, method="cosine", top_k=DEFAULT_TOP_K):
         """
         Retrieve top-K most similar ecosystems for a given query patch.
@@ -117,6 +148,13 @@ class EcosystemRetrievalEngine:
             raw_scores = raw_scores[0]
             # Cosine similarity is already in a natural "higher = more similar" scale.
             scores = raw_scores
+        elif method == "ann":
+            q_norm = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+            raw_scores, indices = self.index_ann.search(q_norm, k_to_search)
+            # HNSW built with METRIC_INNER_PRODUCT on unit vectors -> inner
+            # product == cosine similarity, same "higher = more similar" scale
+            # as the exact 'cosine' method, but via approximate graph search.
+            scores = raw_scores[0]
         else:
             # 'euclidean' and 'knn' both rank by L2 distance via the same index.
             dists, indices = self.index_l2.search(query_vec, k_to_search)
@@ -238,23 +276,42 @@ def main():
 
     print(f"Loaded {len(valid_entries)} embeddings from {emb_dir}/")
 
-    # Initialize retrieval engine
+    # ---------------------------------------------------------------
+    # Operational feasibility (faculty comment: report processing time,
+    # memory, scalability). index_build_time_s covers building all four
+    # FAISS indices (cosine/L2/HNSW); per-method search_all_time_s covers
+    # a full leave-one-out sweep (every patch queried against every
+    # other); peak_rss_mb is the whole process's peak resident memory at
+    # the point this script finishes, via resource.getrusage -- a coarse
+    # but dependency-free proxy for "memory requirements".
+    # ---------------------------------------------------------------
+    perf = {"model": model_key, "num_patches": len(valid_entries), "embedding_dim": model_cfg["embedding_dim"]}
+
+    t0 = time.perf_counter()
     engine = EcosystemRetrievalEngine(valid_entries, embeddings)
+    perf["index_build_time_s"] = round(time.perf_counter() - t0, 4)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # ---------------------------------------------------------------
-    # 1. Run retrieval for all three methods
+    # 1. Run retrieval for all four methods
     # ---------------------------------------------------------------
 
     all_results = {}
+    perf["search"] = {}
 
     for method in EcosystemRetrievalEngine.SUPPORTED_METHODS:
         print(f"\nRunning {method.upper()} retrieval for all {len(valid_entries)} patches...")
 
         # Retrieve all (not just top_k) for evaluation purposes
+        t0 = time.perf_counter()
         full_results = engine.search_all(method=method, top_k=len(valid_entries))
+        elapsed = time.perf_counter() - t0
         all_results[method] = full_results
+        perf["search"][method] = {
+            "total_time_s": round(elapsed, 4),
+            "avg_query_time_ms": round(1000.0 * elapsed / max(len(valid_entries), 1), 4),
+        }
 
         # Print example queries
         example_ids = list(embeddings.keys())[:3]
@@ -312,6 +369,29 @@ def main():
     print(f"\n  Output files:")
     print(f"    {results_path}")
     print(f"    {analog_path}")
+
+    # ---------------------------------------------------------------
+    # 4. Save operational-feasibility report (perf: time + memory)
+    # ---------------------------------------------------------------
+    perf["peak_rss_mb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)  # KB -> MB on Linux
+
+    perf_path = f"{RESULTS_DIR}/retrieval_perf.json"
+    all_perf = {}
+    if os.path.exists(perf_path):
+        with open(perf_path) as f:
+            all_perf = json.load(f)
+    all_perf[model_key] = perf
+    with open(perf_path, "w") as f:
+        json.dump(all_perf, f, indent=2)
+
+    print(f"\n  Operational feasibility ({label}):")
+    print(f"    Index build time:  {perf['index_build_time_s']:.3f}s for {len(valid_entries)} patches ({model_cfg['embedding_dim']}D)")
+    for method, m in perf["search"].items():
+        print(f"    {method:<10} full leave-one-out sweep: {m['total_time_s']:.3f}s "
+              f"({m['avg_query_time_ms']:.3f}ms/query avg)")
+    print(f"    Peak process memory (RSS): {perf['peak_rss_mb']:.1f} MB")
+    print(f"    Saved to: {perf_path}")
+
     print(f"\nDone. Run 07_evaluate_retrieval.py next to evaluate retrieval performance.")
 
 
