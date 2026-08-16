@@ -38,16 +38,91 @@ Run:
     python 09_explainability_engine.py
 """
 
+import importlib.util
 import json
 import os
 import numpy as np
 from tqdm import tqdm
 
-from config import METADATA_CATALOG_PATH, RESULTS_DIR
+from config import METADATA_CATALOG_PATH, RESULTS_DIR, PATCH_SIZE_M
 import geo_lookups
 
 OUT_DESCRIPTORS_PATH = f"{RESULTS_DIR}/ecosystem_descriptors.json"
 OUT_EXPLAIN_PATH = f"{RESULTS_DIR}/explainable_retrieval.json"
+
+
+# ---------------------------------------------------------------
+# Disturbance history (faculty comment: "discuss whether retrieved
+# ecosystems represent similar disturbance pathways ... rather than
+# simply similar imagery. With historical imagery analyse whether
+# retrieved ecosystem analogs exhibit comparable ecological
+# trajectories over time.")
+# ---------------------------------------------------------------
+#
+# Reuses 10_grid_tiling_labels.py's Hansen Global Forest Change tile
+# helpers (dynamic import -- numbered filenames aren't importable with
+# a normal `import 10_...` statement, same pattern already used by
+# 11_forest_risk_forecast.py::predict_risk()) to pull a real, dated
+# loss-year history for each patch, not just its current-snapshot
+# forest_cover value. This turns "these two patches look similar
+# today" into "these two patches have lost tree cover in the same
+# years" -- a trajectory comparison, not a single-frame one.
+_tiling = None
+
+
+def _get_tiling_module():
+    global _tiling
+    if _tiling is None:
+        spec = importlib.util.spec_from_file_location(
+            "tiling", os.path.join(os.path.dirname(__file__), "10_grid_tiling_labels.py")
+        )
+        _tiling = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_tiling)
+    return _tiling
+
+
+def get_disturbance_history(lon, lat):
+    """
+    Real Hansen lossyear history over the patch's full footprint
+    (config.PATCH_SIZE_M, matching what was actually acquired for this
+    location -- not an arbitrary window size).
+
+    Returns None for every field if the Hansen tile for this location
+    isn't available (not cached and couldn't be downloaded) -- same
+    "None means unavailable, never fabricated" contract every other
+    field in this module follows.
+    """
+    tiling = _get_tiling_module()
+    half_km = (PATCH_SIZE_M / 1000.0) / 2.0
+    d_lat, d_lon = tiling.km_to_deg(half_km, lat)
+
+    lossyear_path = tiling.ensure_hansen_tile("lossyear", lat, lon)
+    if lossyear_path is None:
+        return {"loss_years": None, "years_since_last_loss": None, "cumulative_loss_pct": None}
+
+    lossyear_arr, _, _ = tiling.read_window(
+        lossyear_path, lon - d_lon, lat - d_lat, lon + d_lon, lat + d_lat
+    )
+    if lossyear_arr is None or lossyear_arr.size == 0:
+        return {"loss_years": None, "years_since_last_loss": None, "cumulative_loss_pct": None}
+
+    total_px = lossyear_arr.size
+    loss_years = {}
+    for offset in np.unique(lossyear_arr):
+        if offset == 0:
+            continue
+        year = 2000 + int(offset)
+        pct = round(100.0 * float(np.sum(lossyear_arr == offset)) / total_px, 3)
+        loss_years[year] = pct
+
+    years_since_last_loss = max(loss_years.keys()) if loss_years else None
+    cumulative_loss_pct = round(sum(loss_years.values()), 3)
+
+    return {
+        "loss_years": loss_years,           # {year: pct_of_patch_lost_that_year}
+        "years_since_last_loss": years_since_last_loss,
+        "cumulative_loss_pct": cumulative_loss_pct,
+    }
 
 
 def calculate_patch_descriptors(entry):
@@ -135,6 +210,20 @@ def calculate_patch_descriptors(entry):
     desc["climate_source"] = phys["climate_source"]
     desc["elevation_source"] = phys["elevation_source"]
     desc["ecoregion_source"] = phys["ecoregion_source"]
+
+    # Real Hansen-derived disturbance history -- scoped to forest/mangrove
+    # patches, where tree-cover loss is the ecologically meaningful signal
+    # this data source can speak to (a "loss year" over farmland or open
+    # water is not informative and would just burn Hansen tile downloads
+    # for no scientific benefit). Non-forest/mangrove patches get None,
+    # same "unavailable, not fabricated" contract as every other field.
+    if entry.get("ecosystem") in ("forest", "mangrove"):
+        disturbance = get_disturbance_history(lon, lat)
+    else:
+        disturbance = {"loss_years": None, "years_since_last_loss": None, "cumulative_loss_pct": None}
+    desc["loss_years"] = disturbance["loss_years"]
+    desc["years_since_last_loss"] = disturbance["years_since_last_loss"]
+    desc["cumulative_loss_pct"] = disturbance["cumulative_loss_pct"]
 
     return desc
 
@@ -234,6 +323,28 @@ def generate_explanation(q, a):
             factors.append("shared conservation status as designated protected zones")
         else:
             factors.append("similar unprotected conservation status")
+
+    # 8. Disturbance history (real Hansen lossyear data, forest/mangrove
+    #    only -- see get_disturbance_history()). This is a TRAJECTORY
+    #    comparison, not a snapshot one: it asks whether the two patches
+    #    lost tree cover in the SAME years, not just whether they look
+    #    similar today.
+    if q.get("loss_years") is not None and a.get("loss_years") is not None:
+        q_years = set(q["loss_years"].keys())
+        a_years = set(a["loss_years"].keys())
+        union = q_years | a_years
+        jaccard = len(q_years & a_years) / len(union) if union else 1.0
+        metrics["disturbance_trajectory_jaccard"] = round(jaccard, 3)
+        cum_diff = abs(q["cumulative_loss_pct"] - a["cumulative_loss_pct"])
+        metrics["cumulative_loss_pct_diff"] = round(cum_diff, 2)
+        if not q_years and not a_years:
+            factors.append("no detected tree-cover loss in either location's Hansen record (both stable)")
+        elif jaccard > 0.3:
+            shared = sorted(q_years & a_years)
+            factors.append(f"overlapping disturbance history (tree-cover loss recorded in {len(shared)} of the same year(s): {shared})")
+    else:
+        metrics["disturbance_trajectory_jaccard"] = None
+        metrics["cumulative_loss_pct_diff"] = None
 
     if len(factors) == 0:
         explanation = "These two ecosystems share general ecological attributes with small variations in overall land cover profiles."
