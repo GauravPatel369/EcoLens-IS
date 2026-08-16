@@ -12,6 +12,7 @@ __pycache__/
 
 # Model checkpoints & configs (large files/downloads)
 Prithvi_100M.pt
+clay_checkpoint/
 # Prithvi_100M_config.yaml
 # config.yaml
 
@@ -24,6 +25,8 @@ patches_processed/
 embeddings/
 embeddings_vit/
 embeddings_resnet/
+embeddings_clay/
+embeddings_satlas/
 # metadata/catalog.json
 
 # Generated Dashboards
@@ -32,6 +35,18 @@ retrieval_dashboard.html
 
 # Objective 2 — Retrieval Results
 results/
+results-2/
+
+# Python packaging build artifacts
+*.egg-info/
+build/
+dist/
+
+# Office / LibreOffice lock & autorecover files
+~$*.doc*
+~$*.xls*
+~$*.ppt*
+.~lock.*#
 
 # IDE / System files
 .vscode/

@@ -26,6 +26,7 @@ torch>=2.1                   # model inference (02, 03) -- install a CUDA build 
 timm>=0.9                    # ViT-Base / ResNet-50 (03_extract_embeddings.py)
 huggingface_hub>=0.20        # Prithvi-100M checkpoint download (03)
 pyyaml>=6.0                  # config.yaml parsing (03)
+einops>=0.6                  # PrithviMAE dependency (03)
 
 # --- Retrieval ---
 faiss-cpu>=1.7               # similarity search index (06_retrieval_engine.py)
@@ -35,6 +36,10 @@ faiss-cpu>=1.7               # similarity search index (06_retrieval_engine.py)
 scikit-learn>=1.2            # HistGradientBoostingClassifier needs class_weight support,
                               # added in 1.2 (11_forest_risk_forecast.py)
 joblib>=1.3                  # model serialization (11)
+xgboost>=2.0.0               # XGBoost benchmarking (11)
+lightgbm>=4.0.0              # LightGBM benchmarking (11)
+shap>=0.40.0                 # SHAP explainability (11)
+matplotlib>=3.5.0            # SHAP plotting and charts (11)
 
 # --- Dashboards ---
 # 05_create_database_and_dashboard.py uses only numpy (PCA is hand-rolled).
