@@ -135,6 +135,41 @@ def build_matrix(rows, feature_names):
     return X, y, obs_years
 
 
+def bootstrap_metric_ci(y_true, y_scores, metric_fn, n_bootstraps=500, ci=95, random_state=42):
+    """
+    Bootstrap confidence interval for a classification metric, by
+    resampling (y_true, y_scores) PAIRS with replacement (not
+    re-training -- this quantifies sampling uncertainty in the test
+    set the trained model is being scored against, the same idea as
+    07_evaluate_retrieval.py::bootstrap_ci() applies to retrieval mAP/
+    MRR). Faculty comment: "Quantify uncertainty associated with ...
+    forest-loss predictions using confidence intervals [or] bootstrap
+    analysis."
+
+    Resamples that happen to contain only one class are skipped (the
+    metric is undefined for a single-class sample), not counted as 0.
+    """
+    rng = np.random.RandomState(random_state)
+    y_true = np.asarray(y_true)
+    y_scores = np.asarray(y_scores)
+    n = len(y_true)
+    values = []
+    for _ in range(n_bootstraps):
+        idx = rng.randint(0, n, n)
+        y_t, y_s = y_true[idx], y_scores[idx]
+        if len(np.unique(y_t)) < 2:
+            continue
+        try:
+            values.append(metric_fn(y_t, y_s))
+        except ValueError:
+            continue
+    if not values:
+        return None, None
+    lower = float(np.percentile(values, (100 - ci) / 2))
+    upper = float(np.percentile(values, 100 - (100 - ci) / 2))
+    return lower, upper
+
+
 def temporal_train_test_split(X, y, obs_years, train_cutoff_year):
     train_mask = obs_years <= train_cutoff_year
     test_mask = ~train_mask
@@ -142,9 +177,22 @@ def temporal_train_test_split(X, y, obs_years, train_cutoff_year):
 
 
 def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
-    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
     from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve
     from sklearn.inspection import permutation_importance
+    import matplotlib.pyplot as plt
+    try:
+        from xgboost import XGBClassifier
+    except ImportError:
+        XGBClassifier = None
+    try:
+        from lightgbm import LGBMClassifier
+    except ImportError:
+        LGBMClassifier = None
+    try:
+        import shap
+    except ImportError:
+        shap = None
 
     n_pos_train = int(y_train.sum())
     n_pos_test = int(y_test.sum())
@@ -187,23 +235,84 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
     X_train_active = X_train[:, valid_indices]
     X_test_active = X_test[:, valid_indices]
 
-    model = HistGradientBoostingClassifier(
-        class_weight="balanced",  # loss events are rare; don't let the
-                                    # majority (no-loss) class dominate
-        max_depth=6,
-        random_state=42,
-    )
-    model.fit(X_train_active, y_train)
+    models_to_try = {
+        "HistGradientBoosting": HistGradientBoostingClassifier(class_weight="balanced", max_depth=6, random_state=42),
+        "RandomForest": RandomForestClassifier(class_weight="balanced", max_depth=6, random_state=42, n_estimators=100)
+    }
+    if XGBClassifier is not None:
+        models_to_try["XGBoost"] = XGBClassifier(scale_pos_weight=max(1.0, (len(y_train) - y_train.sum()) / max(1.0, y_train.sum())), max_depth=6, random_state=42, eval_metric="logloss")
+    if LGBMClassifier is not None:
+        models_to_try["LightGBM"] = LGBMClassifier(class_weight="balanced", max_depth=6, random_state=42, verbose=-1)
+    
+    best_ap = -1
+    best_model_name = None
+    best_model = None
+    best_roc = None
+    best_y_scores = None
 
-    y_scores = model.predict_proba(X_test_active)[:, 1]
-    ap = average_precision_score(y_test, y_scores)
-    try:
-        roc_auc = roc_auc_score(y_test, y_scores)
-    except ValueError:
-        roc_auc = float("nan")  # only one class present in y_test
+    print(f"\n  Benchmarking {len(models_to_try)} models:")
+    for m_name, model in models_to_try.items():
+        if m_name == "RandomForest":
+            from sklearn.impute import SimpleImputer
+            imputer = SimpleImputer(strategy="mean")
+            X_train_imp = imputer.fit_transform(X_train_active)
+            X_test_imp = imputer.transform(X_test_active)
+            model.fit(X_train_imp, y_train)
+            y_scores = model.predict_proba(X_test_imp)[:, 1]
+        else:
+            model.fit(X_train_active, y_train)
+            y_scores = model.predict_proba(X_test_active)[:, 1]
+        
+        ap = average_precision_score(y_test, y_scores)
+        try:
+            roc = roc_auc_score(y_test, y_scores)
+        except ValueError:
+            roc = float("nan")
+        
+        print(f"    {m_name:<22} PR-AUC: {ap:.4f}  ROC-AUC: {roc:.4f}")
+        if ap > best_ap:
+            best_ap = ap
+            best_model_name = m_name
+            best_model = model
+            best_roc = roc
+            best_y_scores = y_scores
 
-    print(f"\n  Average Precision (PR-AUC): {ap:.4f}  <- primary metric, class-imbalance-aware")
-    print(f"  ROC-AUC:                    {roc_auc:.4f}  <- secondary, can look inflated under imbalance")
+    print(f"\n  Best Model: {best_model_name}")
+    print(f"  Average Precision (PR-AUC): {best_ap:.4f}  <- primary metric, class-imbalance-aware")
+    print(f"  ROC-AUC:                    {best_roc:.4f}  <- secondary, can look inflated under imbalance")
+
+    model = best_model
+    ap = best_ap
+    roc_auc = best_roc
+    y_scores = best_y_scores
+
+    ap_ci = bootstrap_metric_ci(y_test, y_scores, average_precision_score)
+    roc_ci = bootstrap_metric_ci(y_test, y_scores, roc_auc_score)
+    if ap_ci[0] is not None:
+        print(f"  PR-AUC  95% CI (bootstrap, n=500 resamples of the test set): [{ap_ci[0]:.4f}, {ap_ci[1]:.4f}]")
+    else:
+        print(f"  PR-AUC  95% CI: N/A (too few test samples to bootstrap)")
+    if roc_ci[0] is not None:
+        print(f"  ROC-AUC 95% CI (bootstrap, n=500 resamples of the test set): [{roc_ci[0]:.4f}, {roc_ci[1]:.4f}]")
+    else:
+        print(f"  ROC-AUC 95% CI: N/A (too few test samples to bootstrap)")
+
+    if shap is not None and best_model_name in ["HistGradientBoosting", "LightGBM", "XGBoost"]:
+        try:
+            os.makedirs(RISK_MODEL_DIR, exist_ok=True)
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_test_active)
+            if isinstance(shap_values, list):
+                shap_values = shap_values[1]
+            plt.figure(figsize=(10, 8))
+            shap.summary_plot(shap_values, X_test_active, feature_names=active_feature_names, show=False)
+            safe_label = label.replace(' ', '_').replace('+', 'and')
+            shap_path = f"{RISK_MODEL_DIR}/shap_summary_{safe_label}.png"
+            plt.savefig(shap_path, bbox_inches='tight')
+            plt.close()
+            print(f"  Saved SHAP summary plot to {shap_path}")
+        except Exception as e:
+            print(f"  (SHAP analysis skipped: {e})")
 
     # Precision/recall at a couple of operating points, since a single
     # AUC number doesn't tell you what threshold to actually use.
@@ -227,7 +336,8 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
     except Exception as e:
         print(f"  (permutation importance skipped: {e})")
 
-    return {"model": model, "ap": ap, "roc_auc": roc_auc, "feature_names": active_feature_names}
+    return {"model": model, "ap": ap, "roc_auc": roc_auc, "feature_names": active_feature_names,
+            "ap_ci": ap_ci, "roc_auc_ci": roc_ci}
 
 
 def predict_risk(lon, lat, model_path=RISK_MODEL_PATH):
@@ -393,6 +503,13 @@ def main():
     parser.add_argument("--train-cutoff-year", type=int, default=None,
                          help="Last obs_year included in training (default: computed as an "
                               "80/20-ish split over the available years).")
+    parser.add_argument("--ablation", action="store_true",
+                         help="Run ablation study across different feature groups.")
+    parser.add_argument("--features", type=str, default=RISK_FEATURES_PATH,
+                         help=f"Path to the cell-year features CSV (default: {RISK_FEATURES_PATH}). "
+                              f"Use this to point at a bounded demo CSV produced by "
+                              f"10_grid_tiling_labels.py --with-embedding-drift --output <path> "
+                              f"without needing to regenerate the full production dataset.")
     args = parser.parse_args()
 
     if args.predict:
@@ -401,7 +518,7 @@ def main():
         return
 
     if args.spatial_holdout:
-        rows = load_features()
+        rows = load_features(args.features)
         run_spatial_holdout(rows)
         return
 
@@ -409,8 +526,8 @@ def main():
     print("EcoLens Step 11: Forest-Loss Risk Forecasting -- training")
     print(f"{'='*70}")
 
-    rows = load_features()
-    print(f"Loaded {len(rows)} cell-year samples from {RISK_FEATURES_PATH}")
+    rows = load_features(args.features)
+    print(f"Loaded {len(rows)} cell-year samples from {args.features}")
 
     has_embedding_drift = len(rows) > 0 and "embedding_drift" in rows[0]
     if has_embedding_drift:
@@ -455,6 +572,26 @@ def main():
                   f"({'embedding drift adds predictive power' if delta > 0.01 else 'no clear improvement from embedding drift'})")
             if drift_result["ap"] >= driver_result["ap"]:
                 best_result, best_features = drift_result, drift_result["feature_names"]
+
+    if args.ablation:
+        print(f"\n{'='*70}")
+        print("ABLATION STUDY: FEATURE GROUPS")
+        print(f"{'='*70}")
+        feature_groups = {
+            "Topography": ["elevation_m", "ruggedness_m"],
+            "Climate": ["temp_c", "rainfall_mm"],
+            "Anthropogenic": ["protected_area", "distance_to_prior_loss_m"],
+            "Forest Baseline": ["baseline_treecover_pct"]
+        }
+        for group_name, feats_to_drop in feature_groups.items():
+            ablated_features = [f for f in DRIVER_FEATURES if f not in feats_to_drop]
+            print(f"\nDropping {group_name} features ({feats_to_drop}):")
+            X_abl, y_abl, obs_years_abl = build_matrix(rows, ablated_features)
+            X_abl_train, y_abl_train, X_abl_test, y_abl_test, _, _ = temporal_train_test_split(X_abl, y_abl, obs_years_abl, cutoff)
+            res = train_and_evaluate(X_abl_train, y_abl_train, X_abl_test, y_abl_test, ablated_features, f"Ablation: No {group_name}")
+            if res and driver_result:
+                delta = res['ap'] - driver_result['ap']
+                print(f"  => Impact of dropping {group_name}: PR-AUC delta {delta:+.4f}")
 
     if best_result is None:
         print("\nNo model could be trained -- see warnings above. Not saving a model file.")

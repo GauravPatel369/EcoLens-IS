@@ -75,6 +75,177 @@ HANSEN_DATA_THROUGH_YEAR = 2023
 OBS_YEAR_START = 2005
 OBS_YEAR_END = HANSEN_DATA_THROUGH_YEAR - RISK_HORIZON_YEARS
 
+DRIFT_YEARS_BACK = 5  # years between the two embeddings compared for drift
+
+
+# ---------------------------------------------------------------
+# Embedding drift (--with-embedding-drift, optional)
+# ---------------------------------------------------------------
+#
+# THE HYPOTHESIS THIS ANSWERS (faculty review comments, verbatim):
+#   "Can geospatial foundation models identify ecological analogs whose
+#    historical disturbance trajectories improve forest-loss risk
+#    forecasting across geographically distinct landscapes?"
+#   "Investigate whether information obtained from retrieved ecosystem
+#    analogs can improve forest-loss prediction."
+#   "Evaluate whether embedding features improve prediction accuracy
+#    when combined with conventional environmental variables."
+#
+# Until this section existed, 11_forest_risk_forecast.py's ablation
+# between "driver features only" and "driver features + embedding
+# drift" could never run for real -- OPTIONAL_FEATURES = ["embedding_
+# drift"] was declared there but no script ever produced that column.
+# Pillar 1 (retrieval) and Pillar 2 (forecasting) were two disconnected
+# halves of the project. This closes that gap: for a grid cell, embed
+# the actual Sentinel-2 imagery at two points in time (via the same
+# 01_acquire_patches / 03_extract_embeddings machinery Pillar 1 already
+# uses) and take the cosine DISTANCE between them as a real, per-cell
+# feature -- "how much has this cell's visual/ecological signature
+# drifted", the same kind of signal the retrieval side is built on.
+#
+# COST-BOUNDED BY DESIGN: computing this for every one of the ~125k
+# cell-year rows in the full dataset means ~250k+ live Sentinel-2
+# STAC searches + patch downloads + model forward passes -- a genuinely
+# heavy extension (README.md's "Next steps" already flagged this).
+# Rather than silently truncating that or refusing to implement it,
+# this is gated behind explicit CLI flags (--with-embedding-drift,
+# --drift-locations, --drift-cells-per-location) so a bounded, REAL
+# proof-of-concept can run today, and the same code scales up to the
+# full dataset by raising those limits (or dropping them) when you
+# have the time/network budget for it. Drift is computed ONCE per
+# cell (not per cell-year) -- between OBS_YEAR_END and
+# OBS_YEAR_END - DRIFT_YEARS_BACK -- and that single value is attached
+# to every obs_year row for that cell, a per-cell "how much has this
+# location drifted recently" feature rather than a fully time-varying
+# one. That's a real scoping simplification, stated here rather than
+# left implicit.
+
+_drift_stac_catalog = None
+_drift_model = None
+_drift_model_key = None
+
+
+def _get_drift_stac_catalog():
+    global _drift_stac_catalog
+    if _drift_stac_catalog is None:
+        import pystac_client
+        import planetary_computer
+        from config import PC_STAC_URL
+        _drift_stac_catalog = pystac_client.Client.open(PC_STAC_URL, modifier=planetary_computer.sign_inplace)
+    return _drift_stac_catalog
+
+
+def _get_ext_module():
+    """Dynamically import 03_extract_embeddings.py (numbered filenames
+    aren't importable with a normal `import 03_...` statement -- same
+    pattern used throughout this project, e.g.
+    11_forest_risk_forecast.py::predict_risk())."""
+    if "_ext_module" not in globals() or globals()["_ext_module"] is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "ext03", os.path.join(os.path.dirname(__file__), "03_extract_embeddings.py")
+        )
+        ext_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ext_mod)
+        globals()["_ext_module"] = ext_mod
+    return globals()["_ext_module"]
+
+
+def _get_acq_module():
+    """Dynamically import 01_acquire_patches.py, same reason/pattern as _get_ext_module()."""
+    if "_acq_module" not in globals() or globals()["_acq_module"] is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "acq01", os.path.join(os.path.dirname(__file__), "01_acquire_patches.py")
+        )
+        acq_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(acq_mod)
+        globals()["_acq_module"] = acq_mod
+    return globals()["_acq_module"]
+
+
+def _get_drift_model(model_key):
+    global _drift_model, _drift_model_key
+    if _drift_model is None or _drift_model_key != model_key:
+        ext_mod = _get_ext_module()
+        from config import SUPPORTED_MODELS
+        if model_key == "prithvi":
+            _drift_model = ext_mod.load_prithvi_model()
+        else:
+            _drift_model = ext_mod.load_timm_model(SUPPORTED_MODELS[model_key]["timm_name"])
+        _drift_model_key = model_key
+    return _drift_model
+
+
+def _find_scene_for_year(stac_catalog, lon, lat, year, buffer_deg=0.05):
+    """Best (lowest-cloud) Sentinel-2 scene anywhere within the given
+    calendar year -- a whole-year window (not a fixed season) since
+    what matters for drift is "the best available look at this cell
+    around this year", not exact seasonal alignment."""
+    from config import MAX_CLOUD_COVER
+    bbox = [lon - buffer_deg, lat - buffer_deg, lon + buffer_deg, lat + buffer_deg]
+    search = stac_catalog.search(
+        collections=["sentinel-2-l2a"],
+        bbox=bbox,
+        datetime=f"{year}-01-01/{year}-12-31",
+        query={"eo:cloud_cover": {"lt": MAX_CLOUD_COVER}},
+    )
+    items = list(search.items())
+    if not items:
+        return None
+    return min(items, key=lambda i: i.properties["eo:cloud_cover"])
+
+
+def compute_cell_embedding(lon, lat, year, model_key="prithvi"):
+    """
+    Real embedding for a grid cell at a given year: search for the best
+    available Sentinel-2 scene that year, extract the patch, run it
+    through the embedding model. Returns a unit-normalized vector, or
+    None if no usable scene was found (e.g. persistent cloud cover).
+    """
+    import torch
+    from config import PATCH_SIZE_M, PATCH_SIZE_PX, PRITHVI_BANDS
+
+    stac_catalog = _get_drift_stac_catalog()
+    item = _find_scene_for_year(stac_catalog, lon, lat, year)
+    if item is None:
+        return None
+
+    model = _get_drift_model(model_key)   # populates _ext_module as a side effect
+    ext_mod = _get_ext_module()
+    acq_mod = _get_acq_module()
+
+    try:
+        patch = acq_mod.extract_patch(item, lon, lat, PATCH_SIZE_M, PATCH_SIZE_PX, PRITHVI_BANDS)
+    except Exception:
+        return None
+
+    if model_key == "prithvi":
+        tensor = torch.from_numpy(patch).float()
+        emb = ext_mod.extract_embedding(model, tensor)
+    else:
+        rgb_tensor = ext_mod.prepare_rgb_tensor(patch)
+        emb = ext_mod.extract_timm_embedding(model, rgb_tensor)
+
+    emb = emb.astype(np.float32)
+    emb /= np.linalg.norm(emb) + 1e-8
+    return emb
+
+
+def compute_embedding_drift_for_cell(lon, lat, year_recent, year_past, model_key="prithvi"):
+    """Cosine DISTANCE (1 - cosine similarity) between a cell's embedding
+    at two points in time. None if either embedding couldn't be computed
+    (e.g. no cloud-free scene available in one of the two years) -- never
+    a fabricated/interpolated value."""
+    from scipy.spatial.distance import cosine
+    emb_recent = compute_cell_embedding(lon, lat, year_recent, model_key)
+    if emb_recent is None:
+        return None
+    emb_past = compute_cell_embedding(lon, lat, year_past, model_key)
+    if emb_past is None:
+        return None
+    return float(cosine(emb_recent, emb_past))
+
 
 # ---------------------------------------------------------------
 # Hansen tile naming / download
@@ -311,23 +482,66 @@ def compute_cell_label_and_features(cell_lon, cell_lat, cell_half_km, tiles, obs
 # ---------------------------------------------------------------
 
 def main():
+    import argparse
     import rasterio
     from contextlib import ExitStack
     from tqdm import tqdm
 
+    parser = argparse.ArgumentParser(description="EcoLens Step 10: Grid Tiling + Hansen Forest-Loss Labels")
+    parser.add_argument("--with-embedding-drift", action="store_true",
+                         help="Also compute a real embedding_drift feature per cell (see module "
+                              "docstring's 'Embedding drift' section) -- needs network access to "
+                              "Planetary Computer for live Sentinel-2 search + download, on top of "
+                              "the Hansen tile downloads this script already does. Cost-bounded by "
+                              "--drift-locations / --drift-cells-per-location below.")
+    parser.add_argument("--drift-model", type=str, default="prithvi",
+                         help="Embedding model to use for drift (default: prithvi, matches Pillar 1's default).")
+    parser.add_argument("--drift-locations", type=int, default=None,
+                         help="Only compute embedding_drift for the first N forest locations "
+                              "(default: all). Does not limit which locations get TILED/LABELED, "
+                              "only which get the extra drift feature -- other cells simply have "
+                              "an empty embedding_drift value, same as any other optional field.")
+    parser.add_argument("--drift-cells-per-location", type=int, default=None,
+                         help="Only compute embedding_drift for the first N cells per location "
+                              "(default: all cells). Use this + --drift-locations to bound a real, "
+                              "small-scale proof-of-concept run instead of the full-scale one.")
+    parser.add_argument("--locations-limit", type=int, default=None,
+                         help="Only tile the first N forest locations at all (bounds Hansen tiling "
+                              "itself, not just drift -- useful for a fast end-to-end demo run).")
+    parser.add_argument("--output", type=str, default=RISK_FEATURES_PATH,
+                         help=f"Output CSV path (default: {RISK_FEATURES_PATH}). Use a different "
+                              f"path for a bounded demo run so it doesn't overwrite the full dataset.")
+    args = parser.parse_args()
+
     forest_locations = [loc for loc in PATCH_LOCATIONS if loc["ecosystem"] in RISK_FOREST_ECOSYSTEMS]
+    if args.locations_limit is not None:
+        forest_locations = forest_locations[:args.locations_limit]
+
+    drift_location_ids = set()
+    if args.with_embedding_drift:
+        drift_locs = forest_locations if args.drift_locations is None else forest_locations[:args.drift_locations]
+        drift_location_ids = {loc["id"] for loc in drift_locs}
+
     print(f"\n{'='*70}")
     print(f"EcoLens Step 10: Grid Tiling + Hansen Forest-Loss Labels")
     print(f"{'='*70}")
     print(f"Regions to tile: {len(forest_locations)} ({RISK_FOREST_ECOSYSTEMS})")
     print(f"Cell size: {GRID_CELL_SIZE_M}m, buffer radius: {GRID_REGION_BUFFER_KM}km")
-    print(f"Observation years: {OBS_YEAR_START}-{OBS_YEAR_END}, horizon: {RISK_HORIZON_YEARS} years\n")
+    print(f"Observation years: {OBS_YEAR_START}-{OBS_YEAR_END}, horizon: {RISK_HORIZON_YEARS} years")
+    if args.with_embedding_drift:
+        print(f"Embedding drift: ENABLED ({args.drift_model}), locations={sorted(drift_location_ids)}, "
+              f"max cells/location={args.drift_cells_per_location or 'all'}, "
+              f"years compared: {OBS_YEAR_END} vs {OBS_YEAR_END - DRIFT_YEARS_BACK}")
+    print()
 
     cell_half_km = (GRID_CELL_SIZE_M / 1000.0) / 2.0
     rows = []
     path_cache = {}      # tile_name -> (treecover_path, lossyear_path)
     dataset_cache = {}   # tile_name -> (treecover_dataset, lossyear_dataset), OPENED ONCE
+    drift_cache = {}     # (round(cell_lon,5), round(cell_lat,5)) -> embedding_drift value or None
     n_missing_tiles = 0
+    n_drift_computed = 0
+    n_drift_failed = 0
 
     # ExitStack guarantees every opened rasterio dataset gets closed when
     # main() exits, even if a location errors out partway through --
@@ -337,6 +551,9 @@ def main():
             print(f"\n[{loc['id']}] Tiling region around {loc['name']} ({loc['lon']}, {loc['lat']})...")
             cells = generate_grid_cells(loc["lon"], loc["lat"], GRID_REGION_BUFFER_KM, GRID_CELL_SIZE_M)
             print(f"  {len(cells)} cells generated")
+
+            compute_drift_here = args.with_embedding_drift and loc["id"] in drift_location_ids
+            drift_cells_remaining = args.drift_cells_per_location if compute_drift_here else 0
 
             for cell_lon, cell_lat in tqdm(cells, desc=f"  {loc['id']} cells"):
                 tile_name = hansen_tile_name(cell_lat, cell_lon)
@@ -359,6 +576,22 @@ def main():
 
                 tiles = dataset_cache[tile_name]
 
+                # Embedding drift is computed ONCE per cell (not per
+                # cell-year -- see module docstring) and reused across
+                # every obs_year row for that cell.
+                cell_key = (round(cell_lon, 5), round(cell_lat, 5))
+                if compute_drift_here and drift_cells_remaining != 0 and cell_key not in drift_cache:
+                    drift_val = compute_embedding_drift_for_cell(
+                        cell_lon, cell_lat, OBS_YEAR_END, OBS_YEAR_END - DRIFT_YEARS_BACK, args.drift_model
+                    )
+                    drift_cache[cell_key] = drift_val
+                    if drift_val is not None:
+                        n_drift_computed += 1
+                    else:
+                        n_drift_failed += 1
+                    if drift_cells_remaining is not None:
+                        drift_cells_remaining -= 1
+
                 for obs_year in range(OBS_YEAR_START, OBS_YEAR_END + 1):
                     result = compute_cell_label_and_features(cell_lon, cell_lat, cell_half_km, tiles, obs_year)
                     if result is None:
@@ -366,7 +599,7 @@ def main():
 
                     geo = geo_lookups.get_physical_descriptors(cell_lon, cell_lat)
 
-                    rows.append({
+                    row = {
                         "region_id": loc["id"],
                         "ecosystem": loc["ecosystem"],
                         "cell_lon": round(cell_lon, 5),
@@ -380,22 +613,30 @@ def main():
                         "elevation_m": geo["elevation_m"],
                         "ruggedness_m": geo["ruggedness_m"],
                         "label_loss_within_horizon": result["label_loss_within_horizon"],
-                    })
+                    }
+                    if args.with_embedding_drift:
+                        drift_val = drift_cache.get(cell_key)
+                        row["embedding_drift"] = "" if drift_val is None else drift_val
+                    rows.append(row)
 
-    os.makedirs(RISK_MODEL_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     if rows:
         fieldnames = list(rows[0].keys())
-        with open(RISK_FEATURES_PATH, "w", newline="") as f:
+        with open(args.output, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
 
     n_positive = sum(r["label_loss_within_horizon"] for r in rows)
     print(f"\n{'='*70}")
-    print(f"Done. {len(rows)} cell-year samples written to {RISK_FEATURES_PATH}")
+    print(f"Done. {len(rows)} cell-year samples written to {args.output}")
     print(f"  Positive (loss within horizon): {n_positive} ({100*n_positive/max(len(rows),1):.1f}%)")
     print(f"  Negative (stable):              {len(rows) - n_positive}")
     print(f"  Unique Hansen tiles touched: {len(path_cache)}")
+    if args.with_embedding_drift:
+        print(f"  Embedding drift computed for {n_drift_computed} cell(s), "
+              f"failed/unavailable for {n_drift_failed} cell(s) "
+              f"(no cloud-free scene found in one of the two years)")
     if n_missing_tiles:
         print(f"\n  WARNING: {n_missing_tiles} Hansen tile(s) could not be downloaded --")
         print(f"  some cells were skipped as a result. See this script's module")
