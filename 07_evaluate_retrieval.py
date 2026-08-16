@@ -96,6 +96,19 @@ def reciprocal_rank(retrieved, relevant_set):
     return 0.0
 
 
+def bootstrap_ci(data, n_bootstraps=1000, ci=95):
+    """Generate confidence intervals via bootstrapping."""
+    if not data:
+        return 0.0, 0.0
+    data = np.array(data)
+    # Generate bootstrap samples
+    bootstraps = np.random.choice(data, size=(n_bootstraps, len(data)), replace=True)
+    means = np.mean(bootstraps, axis=1)
+    lower = np.percentile(means, (100 - ci) / 2)
+    upper = np.percentile(means, 100 - (100 - ci) / 2)
+    return float(lower), float(upper)
+
+
 # ---------------------------------------------------------------
 # Grouping helpers
 # ---------------------------------------------------------------
@@ -190,13 +203,20 @@ def evaluate_method(retrieval_results, catalog_lookup, method_name, k_values, gr
         for item in filtered_results[:max_k]:
             confusion[query_eco][item["ecosystem"]] += 1
 
+    map_lower, map_upper = bootstrap_ci(all_ap) if all_ap else (0.0, 0.0)
+    mrr_lower, mrr_upper = bootstrap_ci(all_rr) if all_rr else (0.0, 0.0)
+
     overall = {
         "method": method_name,
         "group_aware": group_aware,
         "num_queries": num_queries_evaluated,
         "num_queries_skipped": num_queries_skipped,
         "mAP": float(np.mean(all_ap)) if all_ap else 0.0,
+        "mAP_95ci_lower": map_lower,
+        "mAP_95ci_upper": map_upper,
         "MRR": float(np.mean(all_rr)) if all_rr else 0.0,
+        "MRR_95ci_lower": mrr_lower,
+        "MRR_95ci_upper": mrr_upper,
     }
     for k in k_values:
         overall[f"P@{k}"] = float(np.mean(per_k_precision[k])) if per_k_precision[k] else 0.0
@@ -252,11 +272,11 @@ def print_overall_table(evaluations, key="grouped", title="OVERALL RETRIEVAL PER
     methods = list(evaluations.keys())
     k_values = EVALUATION_K_VALUES
 
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 100)
     print(f"{title} ({key.upper()})")
-    print("=" * 80)
+    print("=" * 100)
 
-    header = f"{'Method':<12} {'mAP':<8} {'MRR':<8}"
+    header = f"{'Method':<12} {'mAP (95% CI)':<22} {'MRR':<8}"
     for k in k_values:
         header += f" {'P@'+str(k):<8}"
     for k in k_values:
@@ -266,7 +286,8 @@ def print_overall_table(evaluations, key="grouped", title="OVERALL RETRIEVAL PER
 
     for method in methods:
         overall = _eval_block(evaluations, method, key)["overall"]
-        row = f"{method:<12} {overall['mAP']:<8.4f} {overall['MRR']:<8.4f}"
+        map_str = f"{overall['mAP']:.4f} ({overall.get('mAP_95ci_lower', 0):.2f}-{overall.get('mAP_95ci_upper', 0):.2f})"
+        row = f"{method:<12} {map_str:<22} {overall['MRR']:<8.4f}"
         for k in k_values:
             row += f" {overall[f'P@{k}']:<8.4f}"
         for k in k_values:
