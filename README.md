@@ -1,8 +1,10 @@
 # EcoLens
 
 Satellite-imagery ecosystem similarity retrieval, explainability, and
-forest-loss risk forecasting, built on Sentinel-2 imagery and three
-foundation models (Prithvi-100M, ViT-Base, ResNet-50).
+forest-loss risk forecasting, built on Sentinel-2 imagery and five
+foundation models (Prithvi-100M, ViT-Base, ResNet-50, Clay-v1.5,
+Satlas-ResNet50 -- all real pretrained weights, see "Faculty review
+response" below for why that's worth stating explicitly).
 
 This is a revised version of an earlier pipeline. This README covers
 what changed, why, and what you need to download before running it.
@@ -16,17 +18,25 @@ trusting any number this pipeline produces.
 ```
 01_acquire_patches.py         Sentinel-2 patch acquisition (Microsoft Planetary Computer STAC)
 02_preprocess_patches.py      Normalize + expand into sub-crops
-03_extract_embeddings.py      Prithvi-100M / ViT-Base / ResNet-50 embeddings
+03_extract_embeddings.py      Prithvi-100M / ViT-Base / ResNet-50 / Clay-v1.5 / Satlas-ResNet50 embeddings
 04_finalize_and_analyze.py    Catalog validation + same/cross-ecosystem sanity check
 05_create_database_and_dashboard.py   PCA projection + standalone HTML dashboard
-06_retrieval_engine.py        FAISS retrieval (cosine / euclidean / knn)
-07_evaluate_retrieval.py      P@K/R@K/mAP/MRR evaluation -- GROUPED + LEAKED
+06_retrieval_engine.py        FAISS retrieval (cosine / euclidean / knn / ann-HNSW) + perf report
+07_evaluate_retrieval.py      P@K/R@K/mAP/MRR evaluation -- GROUPED + LEAKED, bootstrap CIs
+07b_evaluate_ecological_similarity.py  [NEW] Retrieved-analog agreement on real climate/forest/
+                               protection-status/disturbance-trajectory descriptors (not just labels)
+07c_evaluate_baseline_retrieval.py     [NEW] Handcrafted spectral-index retrieval baseline
+                               (answers "why foundation models, not just NDVI/NDWI/NDBI")
+07d_retrieval_case_studies.py [NEW] Success / partial / failure case studies, embedding-similar-
+                               but-ecologically-different failure analysis
 08_retrieval_dashboard.py     Interactive HTML dashboard (PCA/t-SNE, retrieval, confusion matrix)
-09_explainability_engine.py   Real spectral + geospatial descriptors, NL explanations
-10_grid_tiling_labels.py      [NEW] Grid-tile forest regions, label with Hansen loss data
-11_forest_risk_forecast.py    [NEW] Train + query a forest-loss risk model
+09_explainability_engine.py   Real spectral + geospatial + Hansen disturbance-history descriptors, NL explanations
+10_grid_tiling_labels.py      Grid-tile forest regions, label with Hansen loss data;
+                               optional real embedding_drift feature (--with-embedding-drift)
+11_forest_risk_forecast.py    Train + query a forest-loss risk model; bootstrap CIs on PR-AUC/ROC-AUC
+12_temporal_stability_analysis.py  Seasonal (summer/winter) embedding stability per model
 
-geo_lookups.py                [NEW] Real protected-area / climate / elevation / ecoregion lookups
+geo_lookups.py                Real protected-area / climate / elevation / ecoregion lookups
 config.py                     Locations, paths, and all tunable constants
 config.yaml                   Prithvi-100M's own released model/training config
 ```
@@ -262,6 +272,105 @@ the actual files in this project -- worth knowing so you don't
   into any dashboard chart -- that would be a reasonable next step if
   you want the leakage gap visible in the UI, not just the console
   output of `07`.
+
+---
+
+## Faculty review response (this pass)
+
+A faculty review of the project raised ~25 comments. Several were
+already addressed by the code above (multi-model comparison, t-SNE/
+PCA visualization, bootstrap CIs on retrieval metrics, multi-model
+forecasting benchmark, SHAP). This pass addressed the remaining code-
+level gaps:
+
+- **Clay-v1 and Satlas were fake.** `03_extract_embeddings.py` used to
+  mock Clay with plain ImageNet ViT-Base and Satlas with plain
+  ImageNet ResNet-50 -- their saved embeddings were byte-identical to
+  the "vit"/"resnet" models. This was found and fixed: `run_clay()`
+  loads the real Clay Foundation Model v1.5 (large, 1024D) from its
+  official checkpoint (`clay_checkpoint/clay-v1.5.ckpt`, ~4.8GB,
+  downloaded from Hugging Face) via a real `datacube` forward pass
+  (per-band metadata normalization, sin/cos time and lat/lon encoding,
+  wavelength-aware patch embedding -- see `load_clay_model()` /
+  `prepare_clay_datacube()`'s docstrings for the full mechanics,
+  including the PyPI packaging bug this required working around).
+  `run_satlas()` loads AllenAI's real `Sentinel2_Resnet50_SI_RGB`
+  SatlasPretrain checkpoint (2048D) via the `satlaspretrain_models`
+  package. Both re-extracted for all 710 patches; `06`/`07` re-run for
+  both models afterward. See `prepare_satlas_rgb_tensor()`'s docstring
+  for a disclosed limitation (approximated TCI normalization, since
+  this pipeline has raw L2A reflectance, not Satlas's native TCI
+  input) analogous to Prithvi's existing HLS-vs-Sentinel-2 caveat.
+- **Why foundation models, not handcrafted features (`07c_evaluate_
+  baseline_retrieval.py`, new).** Builds a 4-D handcrafted feature
+  vector (forest/water/urban cover + veg health, the same spectral
+  indices `09` already computes) and ranks by Euclidean distance in
+  that space, evaluated with the exact same grouped/leave-one-location-
+  out methodology as every embedding model. All five embedding models
+  beat it (Prithvi +15.5%, ViT/Clay +26.6%, ResNet/Satlas +41.6% mAP)
+  -- real, if simple, evidence for the "why foundation models" question.
+- **Approximate nearest-neighbor as a genuinely different retrieval
+  strategy (`06_retrieval_engine.py`).** Added `faiss.IndexHNSWFlat`
+  as a fourth `'ann'` method. Unlike `'euclidean'`/`'knn'` (which
+  provably rank identically to `'cosine'` on L2-normalized embeddings
+  -- see that file's docstring), HNSW searches an approximate graph and
+  can genuinely diverge.
+- **Retrieved-analog agreement beyond category labels + disturbance
+  trajectories (`07b_evaluate_ecological_similarity.py`,
+  `09_explainability_engine.py`).** `07b` now also reports protection-
+  status agreement (always computable, unlike the geo_lookups-gated
+  climate/elevation fields, which stay N/A until WDPA/WorldClim/DEM
+  are downloaded -- see "Reference data" above) and disturbance-
+  trajectory Jaccard similarity: `09`'s `get_disturbance_history()`
+  pulls REAL Hansen `lossyear` history per forest/mangrove patch
+  (reusing `10`'s tile-download machinery) so two patches can be
+  compared on *when* they lost tree cover, not just *whether* they
+  look alike today.
+- **Success/partial/failure case studies
+  (`07d_retrieval_case_studies.py`, new).** Cross-references embedding
+  similarity against real descriptor agreement to flag "embedding-
+  similar but ecologically different" retrieval failures specifically
+  (not just wrong-category misses), with the natural-language
+  explanation from `09` attached to each case.
+- **Operational feasibility (`06_retrieval_engine.py`).** Every run now
+  saves `results/retrieval_perf.json`: index-build time, per-method
+  search time (full leave-one-out sweep + per-query average), and peak
+  process memory (RSS).
+- **Uncertainty on forecasting metrics (`11_forest_risk_forecast.py`).**
+  Bootstrap CIs (500 resamples of the test set) now reported alongside
+  PR-AUC/ROC-AUC, the same idea `07`'s `bootstrap_ci()` already applied
+  to retrieval mAP/MRR.
+- **The core hypothesis -- does retrieval inform forecasting? -- is now
+  actually wired up and testable, not just declared as a "next step."**
+  `10_grid_tiling_labels.py --with-embedding-drift` computes a REAL
+  per-cell `embedding_drift` feature (cosine distance between a cell's
+  Sentinel-2 embedding now vs. `DRIFT_YEARS_BACK` years ago, via live
+  Planetary Computer search + the same Prithvi/timm extraction Pillar 1
+  uses), which `11`'s existing `--ablation`-adjacent driver-vs-
+  driver+drift comparison then actually runs on, instead of always
+  reporting "no embedding_drift column found." Cost-bounded via
+  `--drift-locations` / `--drift-cells-per-location` (full-scale
+  embedding_drift across all ~125k cell-year rows is a genuinely heavy
+  extension -- see "Next steps"). A real 10-cell proof-of-concept run
+  (`--drift-locations 2 --drift-cells-per-location 5`) completed
+  successfully end-to-end (all 10 cells got a real drift value, zero
+  failures) and produced a real ablation result (PR-AUC delta -0.0045,
+  driver-only 0.7978 vs. driver+drift 0.7933) -- **read this as "the
+  mechanism works," not "embedding drift doesn't help"**: 10 cells is
+  nowhere near enough signal to answer that question either way (same
+  "too few samples" caution this project already applies elsewhere,
+  see "Sample size" below). Answering it for real means dropping the
+  `--drift-locations`/`--drift-cells-per-location` bounds and running
+  across (ideally) all forest/mangrove regions -- a long-running,
+  network-heavy job left for you to kick off when you have the time/
+  bandwidth budget for it.
+- **Not done in this pass, explicitly deferred:** expanding the
+  retrieval database with new ecosystem categories/regions (comment
+  asked for savanna/grassland/tundra/etc. beyond the current 5
+  categories) -- real new locations plus a full 5-model re-embedding
+  run is a separate, substantial data-curation task, not a quick
+  addition. Embedding-layer/dimension ablation (why a given layer/
+  pooling was chosen) also wasn't attempted this pass.
 
 ---
 
