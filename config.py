@@ -73,6 +73,10 @@ PATCH_LOCATIONS = [
      "name": "Jiuzhaigou Forest, China", "protected_area": True, "climatic_region": "Montane Deciduous"},
     {"id": "forest_015", "ecosystem": "forest", "lon": -1.0730, "lat": 53.2030,
      "name": "Sherwood Forest, UK", "protected_area": True, "climatic_region": "Temperate Deciduous"},
+    {"id": "forest_016", "ecosystem": "forest", "lon": -105.0000, "lat": 40.0000,
+     "name": "Rocky Mountain National Park, USA", "protected_area": True, "climatic_region": "Montane Forest"},
+    {"id": "forest_017", "ecosystem": "forest", "lon": 14.5000, "lat": -2.5000,
+     "name": "Salonga National Park, DRC", "protected_area": True, "climatic_region": "Tropical Rainforest"},
 
     # Wetlands (15)
     {"id": "wetland_001", "ecosystem": "wetland", "lon": 81.8500, "lat": 26.7500,
@@ -105,6 +109,10 @@ PATCH_LOCATIONS = [
      "name": "Mesopotamian Marshes, Iraq", "protected_area": False, "climatic_region": "Arid Marshland"},
     {"id": "wetland_015", "ecosystem": "wetland", "lon": 6.2000, "lat": 53.4500,
      "name": "Wadden Sea Salt Marshes, Netherlands", "protected_area": True, "climatic_region": "Temperate Coastal"},
+    {"id": "wetland_016", "ecosystem": "wetland", "lon": -91.0000, "lat": 30.0000,
+     "name": "Atchafalaya Basin, USA", "protected_area": True, "climatic_region": "Humid Subtropical"},
+    {"id": "wetland_017", "ecosystem": "wetland", "lon": -60.0000, "lat": -30.0000,
+     "name": "Ibera Wetlands, Argentina", "protected_area": True, "climatic_region": "Humid Subtropical"},
 
     # Mangroves (15)
     {"id": "mangrove_001", "ecosystem": "mangrove", "lon": 88.8500, "lat": 21.9500,
@@ -137,6 +145,10 @@ PATCH_LOCATIONS = [
      "name": "Matang Mangrove Forest, Malaysia", "protected_area": True, "climatic_region": "Tropical Coastal"},
     {"id": "mangrove_015", "ecosystem": "mangrove", "lon": 113.6800, "lat": -25.8000,
      "name": "Shark Bay Mangroves, Australia", "protected_area": True, "climatic_region": "Semi-Arid Coastal"},
+    {"id": "mangrove_016", "ecosystem": "mangrove", "lon": -81.0000, "lat": 24.5000,
+     "name": "Key West Mangroves, USA", "protected_area": True, "climatic_region": "Tropical Coastal"},
+    {"id": "mangrove_017", "ecosystem": "mangrove", "lon": 47.5000, "lat": -15.5000,
+     "name": "Mahajamba Bay Mangroves, Madagascar", "protected_area": True, "climatic_region": "Tropical Dry"},
 
     # Agricultural landscapes (15)
     {"id": "agri_001", "ecosystem": "agricultural", "lon": 75.7873, "lat": 30.9000,
@@ -245,6 +257,20 @@ SUPPORTED_MODELS = {
         "embedding_dim": 2048,
         "embeddings_dir": "embeddings_resnet",
         "timm_name": "resnet50",
+    },
+    "clay": {
+        "label": "Clay-v1.5",
+        "description": "Clay Foundation Model v1.5, large (real weights, 1024D)",
+        "embedding_dim": 1024,
+        "embeddings_dir": "embeddings_clay",
+        "timm_name": None,                       # Not a timm model -- see load_clay_model()
+    },
+    "satlas": {
+        "label": "Satlas-ResNet50",
+        "description": "AllenAI SatlasPretrain Sentinel2_Resnet50_SI_RGB (real weights, 2048D)",
+        "embedding_dim": 2048,
+        "embeddings_dir": "embeddings_satlas",
+        "timm_name": None,                       # Not a timm model -- see load_satlas_model()
     },
 }
 

@@ -211,6 +211,343 @@ def extract_timm_embedding(model, rgb_tensor):
 
 
 # ---------------------------------------------------------------
+# Clay (Clay Foundation Model v1.5) -- REAL weights
+# ---------------------------------------------------------------
+#
+# HISTORY: same story as Satlas above -- this pipeline used to mock
+# Clay by running plain ImageNet ViT-Base and saving it under the clay
+# label (embeddings byte-identical to the "vit" model's output). This
+# section replaces that with the real `claymodel` package (PyPI
+# `claymodel==1.5.0`) and the real clay-v1.5.ckpt checkpoint.
+#
+# PACKAGING BUG WORKAROUND (environment setup, not a per-run step):
+# the published `claymodel` wheel installs its modules flattened
+# directly into site-packages (module.py, model.py, backbone.py, ...)
+# with internal `from src.model import ...`-style absolute imports
+# that assume a top-level `src` package -- which the wheel never
+# actually creates. Confirmed by inspecting the wheel's own RECORD /
+# top_level.txt (lists bare module names, not a `claymodel` package)
+# and by the resulting ModuleNotFoundError. Fixed once, in this
+# environment's site-packages, by relocating those files into a real
+# `src/` package (`from src.module import ClayMAEModule` is what
+# actually works here) -- not something this script can fix at import
+# time, so if you're setting this up fresh, see README.md.
+#
+# BAND CHOICE: Clay is explicitly designed to accept an arbitrary
+# band subset (see its own wall-to-wall tutorial, which uses only 4 of
+# its 10 known Sentinel-2 bands) as long as each band's wavelength is
+# supplied -- unlike Satlas's fixed 9-band MS checkpoint, this isn't a
+# scope compromise. This project's 6 available bands map directly onto
+# 6 of Clay's known Sentinel-2 band names from its own metadata.yaml:
+#   Blue -> "blue", Green -> "green", Red -> "red",
+#   NIR (B8A, narrow) -> "nir08", SWIR1 (B11) -> "swir16",
+#   SWIR2 (B12) -> "swir22"
+# (Clay's metadata.yaml also defines "rededge1/2/3" and the wide-NIR
+# "nir" (B08), which this project doesn't have -- simply omitted, per
+# Clay's own "any band subset" design, not approximated.)
+
+CLAY_CHECKPOINT_PATH = "clay_checkpoint/clay-v1.5.ckpt"
+CLAY_METADATA_PATH = "clay_checkpoint/metadata.yaml"
+CLAY_PLATFORM = "sentinel-2-l2a"
+CLAY_GSD = 10.0
+CLAY_MODEL_SIZE = "large"  # paired with clay-v1.5.ckpt per Clay's own tutorial
+# Order matches raw patch band order from config.PRITHVI_BANDS:
+# 0=Blue, 1=Green, 2=Red, 3=NIR(B8A), 4=SWIR1(B11), 5=SWIR2(B12)
+CLAY_BAND_NAMES = ["blue", "green", "red", "nir08", "swir16", "swir22"]
+
+_clay_metadata_cache = None
+
+
+def _load_clay_metadata():
+    global _clay_metadata_cache
+    if _clay_metadata_cache is None:
+        with open(CLAY_METADATA_PATH) as f:
+            _clay_metadata_cache = yaml.safe_load(f)
+    return _clay_metadata_cache
+
+
+def load_clay_model():
+    """Load the real Clay-v1.5 (large) MAE encoder from its official checkpoint."""
+    if not os.path.exists(CLAY_CHECKPOINT_PATH):
+        raise FileNotFoundError(
+            f"{CLAY_CHECKPOINT_PATH} not found. Download it (~4.8GB) from "
+            f"https://huggingface.co/made-with-clay/Clay/resolve/main/v1.5/clay-v1.5.ckpt"
+        )
+    if not os.path.exists(CLAY_METADATA_PATH):
+        raise FileNotFoundError(
+            f"{CLAY_METADATA_PATH} not found. Download it from "
+            f"https://raw.githubusercontent.com/Clay-foundation/model/main/configs/metadata.yaml"
+        )
+
+    from src.module import ClayMAEModule
+
+    model = ClayMAEModule.load_from_checkpoint(
+        CLAY_CHECKPOINT_PATH,
+        model_size=CLAY_MODEL_SIZE,
+        metadata_path=CLAY_METADATA_PATH,
+        dolls=[16, 32, 64, 128, 256, 768, 1024],
+        doll_weights=[1, 1, 1, 1, 1, 1, 1],
+        mask_ratio=0.0,   # no masking at inference -- we want the full representation
+        shuffle=False,
+    )
+    model.eval()
+    model.to(DEVICE)
+    return model
+
+
+def prepare_clay_datacube(raw_patch, lon, lat, scene_date_str, batch_size=1):
+    """
+    Build the input dict Clay's encoder expects (datacube), following
+    the model's own wall-to-wall tutorial: per-band normalization from
+    metadata.yaml, sin/cos-encoded acquisition time and lat/lon, each
+    band's wavelength, and ground sample distance.
+
+    raw_patch: (6, H, W) raw-DN array (same scale as Clay's own
+    mean/std stats -- NOT pre-scaled to reflectance/[0,1] first).
+    """
+    metadata = _load_clay_metadata()
+    band_meta = metadata[CLAY_PLATFORM]["bands"]
+
+    mean = np.array([band_meta["mean"][b] for b in CLAY_BAND_NAMES], dtype=np.float32)
+    std = np.array([band_meta["std"][b] for b in CLAY_BAND_NAMES], dtype=np.float32)
+    waves = [band_meta["wavelength"][b] for b in CLAY_BAND_NAMES]
+
+    pixels = raw_patch.astype(np.float32)
+    pixels = (pixels - mean[:, None, None]) / std[:, None, None]
+
+    import datetime
+    import math
+    try:
+        date = datetime.datetime.fromisoformat(scene_date_str)
+    except (TypeError, ValueError):
+        date = datetime.datetime(2021, 6, 1)  # fallback: acquisition date missing from catalog
+    week = date.isocalendar().week * 2 * math.pi / 52
+    hour = getattr(date, "hour", 12) * 2 * math.pi / 24
+    time_vec = [math.sin(week), math.cos(week), math.sin(hour), math.cos(hour)]
+
+    lat_rad, lon_rad = lat * math.pi / 180, lon * math.pi / 180
+    latlon_vec = [math.sin(lat_rad), math.cos(lat_rad), math.sin(lon_rad), math.cos(lon_rad)]
+
+    return {
+        "pixels": torch.from_numpy(pixels).unsqueeze(0),
+        "time": torch.tensor([time_vec], dtype=torch.float32),
+        "latlon": torch.tensor([latlon_vec], dtype=torch.float32),
+        "gsd": torch.tensor(CLAY_GSD, dtype=torch.float32),
+        "waves": torch.tensor(waves, dtype=torch.float32),
+    }
+
+
+@torch.no_grad()
+def extract_clay_embedding(model, datacube):
+    """
+    Run Clay's encoder on a single-item datacube and return the class-
+    token embedding -- the overall per-image embedding, same convention
+    as Clay's own tutorial (`unmsk_patch[:, 0, :]`). mask_ratio=0.0 (set
+    at model load) means no patches are masked, so index 0 is always the
+    CLS token followed by every real patch token, none dropped.
+    """
+    for k in ("pixels", "time", "latlon", "waves"):
+        datacube[k] = datacube[k].to(DEVICE)
+    datacube["gsd"] = datacube["gsd"].to(DEVICE)
+    unmsk_patch, _, _, _ = model.model.encoder(datacube)
+    return unmsk_patch[:, 0, :].squeeze(0).cpu().numpy()
+
+
+def run_clay(catalog):
+    """Extract embeddings using the real Clay-v1.5 (large) encoder."""
+    model_cfg = SUPPORTED_MODELS["clay"]
+    emb_dir = model_cfg["embeddings_dir"]
+    os.makedirs(emb_dir, exist_ok=True)
+
+    print(f"Loading Clay-v1.5 ({CLAY_MODEL_SIZE}) on device: {DEVICE} -- this is a large model, may take a while to load.")
+    model = load_clay_model()
+    print("Model loaded.")
+
+    entries_to_process = []
+    for entry in catalog:
+        patch_path = entry.get("patch_path")
+        if not patch_path or not os.path.exists(patch_path):
+            print(f"[{entry['id']}] No raw patch found. Skipping.")
+            continue
+        out_path = f"{emb_dir}/{entry['id']}.npy"
+        entry["clay_embedding"] = out_path
+        if os.path.exists(out_path):
+            continue
+        entries_to_process.append(entry)
+
+    if entries_to_process:
+        print(f"Extracting Clay embeddings for {len(entries_to_process)} patches "
+              f"(processed one at a time -- Clay's datacube carries per-item time/latlon metadata)...")
+        from tqdm import tqdm
+
+        for entry in tqdm(entries_to_process, desc="Clay Extraction"):
+            raw_patch = np.load(entry["patch_path"])
+            if "crop_offset" in entry:
+                dy, dx = entry["crop_offset"]
+                crop_size = entry.get("crop_size", 160)
+                raw_patch = crop_and_resize_raw(raw_patch, dy, dx, crop_size)
+
+            datacube = prepare_clay_datacube(
+                raw_patch, entry["lon"], entry["lat"], entry.get("scene_date")
+            )
+            emb = extract_clay_embedding(model, datacube).astype(np.float32)
+            emb /= np.linalg.norm(emb) + 1e-8
+            np.save(entry["clay_embedding"], emb)
+    else:
+        print("All Clay embeddings already exist.")
+
+    return catalog
+
+
+# ---------------------------------------------------------------
+# Satlas (AllenAI SatlasPretrain) -- REAL weights
+# ---------------------------------------------------------------
+#
+# HISTORY: this pipeline used to "mock" Satlas by running plain
+# ImageNet ResNet-50 (via timm) and saving it under the satlas label --
+# the embeddings were byte-identical to the "resnet" model's output.
+# That made a Prithvi/ViT/ResNet/Clay/Satlas comparison table
+# structurally incapable of ever showing what it claimed to show. This
+# section replaces that with the real `satlaspretrain_models` package
+# and real AllenAI weights.
+#
+# MODEL CHOICE: Satlas ships both an RGB-only and a 9-band
+# multi-spectral ("MS") Sentinel-2 checkpoint. The MS checkpoint needs
+# B04,B03,B02,B05,B06,B07,B08,B11,B12 -- but this project's patches
+# (config.PRITHVI_BANDS) only carry 6 bands (Blue/Green/Red/B8A-narrow-
+# NIR/SWIR1/SWIR2), missing the three red-edge bands (B05/B06/B07) and
+# using the narrow NIR (B8A) instead of the wide NIR (B08) the MS
+# checkpoint expects. Re-acquiring all 710 patches with the extra
+# bands is a real option (see README "Next steps") but out of scope
+# for this pass. The RGB checkpoint (Sentinel2_Resnet50_SI_RGB) only
+# needs bands we already have (B04,B03,B02), so that's what's used
+# here -- a real, disclosed scope choice, not a silent shortcut.
+
+SATLAS_CHECKPOINT_ID = "Sentinel2_Resnet50_SI_RGB"
+SATLAS_TCI_GAIN = 2.5  # see prepare_satlas_rgb_tensor() docstring
+
+
+def load_satlas_model():
+    """
+    Load AllenAI's real SatlasPretrain Sentinel-2 ResNet-50 (RGB)
+    backbone. Downloads the checkpoint (~215MB) from Hugging Face on
+    first use via the satlaspretrain_models package; cached by that
+    package afterward.
+    """
+    import satlaspretrain_models
+
+    weights_manager = satlaspretrain_models.Weights()
+    model = weights_manager.get_pretrained_model(
+        SATLAS_CHECKPOINT_ID, fpn=False, head=None,
+        device=("cuda" if DEVICE == "cuda" else "cpu"),
+    )
+    model.eval()
+    model.to(DEVICE)
+    return model
+
+
+def prepare_satlas_rgb_tensor(raw_patch):
+    """
+    Prepare a 3-channel tensor for Satlas's Sentinel2_Resnet50_SI_RGB
+    checkpoint.
+
+    Band order Satlas expects: B04, B03, B02 (Red, Green, Blue) with
+    mean=[0,0,0], std=[255,255,255] -- confirmed against AllenAI's own
+    Normalization.md (https://github.com/allenai/satlas/blob/main/
+    Normalization.md) and torchgeo's `_satlas_bands` /
+    `_satlas_transforms` constants (torchgeo/models/swin.py). That
+    normalization assumes the input is Sentinel-2's 8-bit TCI
+    (true-color) product, i.e. already-visualized 0-255 imagery -- NOT
+    raw L2A reflectance DN, which is what this pipeline actually has
+    (see config.PRITHVI_BANDS, raw values ~0-10000).
+
+    KNOWN LIMITATION (disclosed, not silently absorbed -- same spirit
+    as the HLS-vs-Sentinel-2 caveat documented in
+    02_preprocess_patches.py for Prithvi): lacking the real TCI
+    product, this approximates it with the standard Sentinel-2
+    true-color visualization stretch (reflectance * gain, gain=2.5 --
+    the same default gain used by Sentinel Hub / EO Browser's
+    true-color rendering), clipped to [0, 1]. This is a reasonable,
+    documented approximation, not a pixel-identical match to what the
+    checkpoint saw during pretraining -- treat Satlas results with
+    that caveat in mind, exactly as Prithvi's results already carry
+    the HLS-calibration caveat.
+    """
+    rgb = raw_patch[[2, 1, 0], :, :]  # B04, B03, B02 = Red, Green, Blue
+    reflectance = np.clip(rgb, 0, None).astype(np.float32) / 10000.0
+    tci_approx = np.clip(reflectance * SATLAS_TCI_GAIN, 0.0, 1.0)
+    return torch.from_numpy(tci_approx).float()
+
+
+@torch.no_grad()
+def extract_satlas_embedding_batch(model, rgb_batch):
+    """
+    rgb_batch: (B, 3, H, W) tensor from prepare_satlas_rgb_tensor().
+    The Satlas Model (fpn=False, head=None) returns the raw ResNet
+    backbone's 4 multi-scale feature maps [layer1..layer4]; global-
+    average-pool the deepest one (layer4, 2048 channels) into a single
+    embedding vector per image, the same pooling convention timm's
+    resnet50(num_classes=0) applies for the plain "resnet" model.
+    """
+    feats = model(rgb_batch.to(DEVICE))  # [layer1, layer2, layer3, layer4]
+    layer4 = feats[-1]                   # (B, 2048, H/32, W/32)
+    pooled = layer4.mean(dim=[2, 3])     # global average pool -> (B, 2048)
+    return pooled.cpu().numpy()
+
+
+def run_satlas(catalog):
+    """Extract embeddings using the real Satlas Sentinel2_Resnet50_SI_RGB backbone."""
+    model_cfg = SUPPORTED_MODELS["satlas"]
+    emb_dir = model_cfg["embeddings_dir"]
+    os.makedirs(emb_dir, exist_ok=True)
+
+    print(f"Loading Satlas ({SATLAS_CHECKPOINT_ID}) on device: {DEVICE}")
+    model = load_satlas_model()
+    print("Model loaded.")
+
+    entries_to_process = []
+    for entry in catalog:
+        patch_path = entry.get("patch_path")
+        if not patch_path or not os.path.exists(patch_path):
+            print(f"[{entry['id']}] No raw patch found. Skipping.")
+            continue
+        out_path = f"{emb_dir}/{entry['id']}.npy"
+        entry["satlas_embedding"] = out_path
+        if os.path.exists(out_path):
+            continue
+        entries_to_process.append(entry)
+
+    if entries_to_process:
+        print(f"Extracting Satlas embeddings for {len(entries_to_process)} patches...")
+        from tqdm import tqdm
+        batch_size = 16
+
+        for i in tqdm(range(0, len(entries_to_process), batch_size), desc="Satlas Batch Extraction"):
+            batch_entries = entries_to_process[i:i + batch_size]
+
+            tensors = []
+            for entry in batch_entries:
+                raw_patch = np.load(entry["patch_path"])
+                if "crop_offset" in entry:
+                    dy, dx = entry["crop_offset"]
+                    crop_size = entry.get("crop_size", 160)
+                    raw_patch = crop_and_resize_raw(raw_patch, dy, dx, crop_size)
+                tensors.append(prepare_satlas_rgb_tensor(raw_patch))
+
+            batch_x = torch.stack(tensors)  # (B, 3, H, W)
+            pooled = extract_satlas_embedding_batch(model, batch_x)  # (B, 2048)
+
+            for idx, entry in enumerate(batch_entries):
+                emb = pooled[idx].astype(np.float32)
+                emb /= np.linalg.norm(emb) + 1e-8
+                np.save(entry["satlas_embedding"], emb)
+    else:
+        print("All Satlas embeddings already exist.")
+
+    return catalog
+
+
+# ---------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------
 
@@ -360,6 +697,10 @@ def main():
 
     if model_key == "prithvi":
         updated_catalog = run_prithvi(catalog)
+    elif model_key == "clay":
+        updated_catalog = run_clay(catalog)
+    elif model_key == "satlas":
+        updated_catalog = run_satlas(catalog)
     else:
         updated_catalog = run_timm_model(catalog, model_key)
 
