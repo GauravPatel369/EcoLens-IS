@@ -387,7 +387,7 @@ def build_catalog_lookup(all_results):
         break  # Only need one method to build the lookup
 
     if os.path.exists(METADATA_CATALOG_PATH):
-        with open(METADATA_CATALOG_PATH) as f:
+        with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
             catalog = json.load(f)
         for entry in catalog:
             if entry["id"] not in catalog_lookup:
@@ -414,7 +414,7 @@ def evaluate_single_model(results_path, model_key):
     existing JS (ev.<method>.overall etc.) keeps working unmodified and
     now shows the de-leaked numbers automatically.
     """
-    with open(results_path) as f:
+    with open(results_path, encoding="utf-8") as f:
         all_results = json.load(f)
 
     catalog_lookup = build_catalog_lookup(all_results)
@@ -585,7 +585,7 @@ def main():
         print(f"\n  No category had more than one distinct base location -- grouped")
         print(f"  evaluation isn't meaningful on this dataset. Check your catalog.")
         report_path = f"{RESULTS_DIR}/evaluation_report.json"
-        with open(report_path, "w") as f:
+        with open(report_path, "w", encoding="utf-8") as f:
             json.dump(all_model_evals, f, indent=2)
         print(f"\n  Evaluation report saved to: {report_path}")
         return
@@ -607,7 +607,7 @@ def main():
     # ---------------------------------------------------------------
 
     report_path = f"{RESULTS_DIR}/evaluation_report.json"
-    with open(report_path, "w") as f:
+    with open(report_path, "w", encoding="utf-8") as f:
         json.dump(all_model_evals, f, indent=2)
     print(f"\n  Evaluation report saved to: {report_path}")
     print(f"  Top-level overall/per_category/confusion_matrix = GROUPED (honest).")

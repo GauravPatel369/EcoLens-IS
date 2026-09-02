@@ -622,7 +622,7 @@ def main():
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     if rows:
         fieldnames = list(rows[0].keys())
-        with open(args.output, "w", newline="") as f:
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)

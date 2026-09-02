@@ -751,7 +751,7 @@ def main():
         print(f"Error: Catalog not found at {METADATA_CATALOG_PATH}. Run steps 1-3 first.")
         return
 
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
 
     # Compute data for each model that has embeddings
@@ -777,7 +777,7 @@ def main():
     eval_path = f"{RESULTS_DIR}/evaluation_report.json"
     eval_data = {}
     if os.path.exists(eval_path):
-        with open(eval_path) as f:
+        with open(eval_path, encoding="utf-8") as f:
             eval_data = json.load(f)
         print("Loaded evaluation report.")
     else:
@@ -787,7 +787,7 @@ def main():
     explain_path = f"{RESULTS_DIR}/explainable_retrieval.json"
     explain_data = {}
     if os.path.exists(explain_path):
-        with open(explain_path) as f:
+        with open(explain_path, encoding="utf-8") as f:
             explain_data = json.load(f)
         print("Loaded explainable retrieval database.")
     else:

@@ -162,7 +162,7 @@ def _load_cache():
         return _CACHE
     if os.path.exists(GEO_LOOKUP_CACHE_PATH):
         try:
-            with open(GEO_LOOKUP_CACHE_PATH) as f:
+            with open(GEO_LOOKUP_CACHE_PATH, encoding="utf-8") as f:
                 _CACHE = json.load(f)
         except Exception:
             _CACHE = {}
@@ -175,7 +175,7 @@ def _save_cache():
     if _CACHE is None:
         return
     os.makedirs(os.path.dirname(GEO_LOOKUP_CACHE_PATH) or ".", exist_ok=True)
-    with open(GEO_LOOKUP_CACHE_PATH, "w") as f:
+    with open(GEO_LOOKUP_CACHE_PATH, "w", encoding="utf-8") as f:
         json.dump(_CACHE, f, indent=2)
 
 

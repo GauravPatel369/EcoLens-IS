@@ -296,7 +296,7 @@ def main(
 
     # Get parameters --------
 
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     # Support both new config format (model_args & train_params) and legacy format (pretrained_cfg)

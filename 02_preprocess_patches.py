@@ -155,7 +155,7 @@ def compute_custom_norm_stats(base_entries):
 
 
 def main():
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
 
     # Filter base patches to ensure idempotency (rerun safety)
@@ -252,7 +252,7 @@ def main():
 
             updated_catalog.append(sub_entry)
 
-    with open(METADATA_CATALOG_PATH, "w") as f:
+    with open(METADATA_CATALOG_PATH, "w", encoding="utf-8") as f:
         json.dump(updated_catalog, f, indent=2)
 
     print(f"\nSuccessfully generated and processed {len(updated_catalog)} sub-crops. Catalog updated.")

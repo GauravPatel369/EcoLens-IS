@@ -367,7 +367,7 @@ def main():
         print(f"Error: Catalog not found at {METADATA_CATALOG_PATH}. Run steps 1-3 first.")
         return
 
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
 
     # Upfront, honest check of what real reference data is actually
@@ -397,7 +397,7 @@ def main():
         descriptors[entry["id"]] = desc
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(OUT_DESCRIPTORS_PATH, "w") as f:
+    with open(OUT_DESCRIPTORS_PATH, "w", encoding="utf-8") as f:
         json.dump(descriptors, f, indent=2)
     print(f"\nEcosystem descriptors saved to: {OUT_DESCRIPTORS_PATH}")
 
@@ -414,7 +414,7 @@ def main():
     TOP_K = 50
 
     for rfile in retrieval_files:
-        with open(rfile) as f:
+        with open(rfile, encoding="utf-8") as f:
             rdata = json.load(f)
         cosine_results = rdata.get("cosine", {})
         for qid, ranked_list in cosine_results.items():
@@ -443,7 +443,7 @@ def main():
 
     output_data = {"descriptors": descriptors, "explanations": explanations}
 
-    with open(OUT_EXPLAIN_PATH, "w") as f:
+    with open(OUT_EXPLAIN_PATH, "w", encoding="utf-8") as f:
         json.dump(output_data, f, indent=2)
 
     print(f"Explainable similarity matrix saved to: {OUT_EXPLAIN_PATH}")

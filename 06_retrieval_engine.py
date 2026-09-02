@@ -19,7 +19,7 @@ Run:
 import argparse
 import json
 import os
-import resource
+import sys
 import time
 import numpy as np
 import faiss
@@ -30,6 +30,96 @@ from config import (
     RESULTS_DIR, DEFAULT_TOP_K,
     SUPPORTED_MODELS, DEFAULT_MODEL,
 )
+
+
+# ---------------------------------------------------------------
+# Peak memory measurement (cross-platform)
+# ---------------------------------------------------------------
+
+def get_peak_rss_mb():
+    """
+    Peak resident set size of this process in MB, or None if the
+    platform cannot report it.
+
+    This exists because the obvious one-liner --
+    `resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0` --
+    is wrong in two separate ways that both matter here:
+
+      1. `resource` is a Unix-only stdlib module. On Windows the import
+         itself raises ModuleNotFoundError, so a bare `import resource`
+         at the top of this file makes the ENTIRE script unrunnable on
+         Windows -- not just the perf reporting, but retrieval too.
+
+      2. `ru_maxrss` units are platform-dependent: kilobytes on Linux,
+         but BYTES on macOS. Dividing by 1024 unconditionally is
+         therefore off by a factor of 1024 on macOS.
+
+    Windows has no getrusage, but psapi's GetProcessMemoryInfo reports
+    PeakWorkingSetSize, which is the closest equivalent to "peak RSS".
+    It's reachable through ctypes, so this stays dependency-free rather
+    than pulling in psutil just for one number.
+
+    Returns None rather than raising if measurement isn't possible --
+    peak memory is a nice-to-have diagnostic for the operational-
+    feasibility report, never a reason to fail a retrieval run.
+    """
+    try:
+        import resource
+    except ImportError:
+        pass
+    else:
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return round(maxrss / (1024.0 ** 2), 1)   # bytes -> MB
+        return round(maxrss / 1024.0, 1)              # KB -> MB
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD),
+                    ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            # restype/argtypes are NOT optional here. Without them ctypes
+            # assumes a C int return, which truncates the 64-bit HANDLE
+            # from GetCurrentProcess() to 32 bits -- GetProcessMemoryInfo
+            # then silently returns 0 with a zeroed struct rather than
+            # raising, so the bug looks like "unsupported platform".
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            kernel32.GetCurrentProcess.argtypes = []
+            psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+            psapi.GetProcessMemoryInfo.argtypes = [
+                wintypes.HANDLE,
+                ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                wintypes.DWORD,
+            ]
+
+            counters = PROCESS_MEMORY_COUNTERS()
+            counters.cb = ctypes.sizeof(counters)
+            if psapi.GetProcessMemoryInfo(
+                kernel32.GetCurrentProcess(),
+                ctypes.byref(counters),
+                counters.cb,
+            ):
+                return round(counters.PeakWorkingSetSize / (1024.0 ** 2), 1)
+        except Exception:
+            pass
+
+    return None
 
 
 # ---------------------------------------------------------------
@@ -257,7 +347,7 @@ def main():
         print("Run scripts 01-04 first to generate embeddings and catalog.")
         return
 
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
 
     # Load embeddings from the model-specific directory
@@ -328,13 +418,13 @@ def main():
 
     # Save model-specific retrieval results
     results_path = f"{RESULTS_DIR}/retrieval_results_{model_key}.json"
-    with open(results_path, "w") as f:
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nRetrieval results saved to: {results_path}")
 
     # Also save as the default file for backward compatibility
     default_results_path = f"{RESULTS_DIR}/retrieval_results.json"
-    with open(default_results_path, "w") as f:
+    with open(default_results_path, "w", encoding="utf-8") as f:
         json.dump(all_results, f, indent=2)
 
     # ---------------------------------------------------------------
@@ -345,13 +435,13 @@ def main():
     analog_db = engine.build_analog_database(method="cosine", top_k=DEFAULT_TOP_K)
 
     analog_path = f"{RESULTS_DIR}/analog_database_{model_key}.json"
-    with open(analog_path, "w") as f:
+    with open(analog_path, "w", encoding="utf-8") as f:
         json.dump(analog_db, f, indent=2)
     print(f"Ecosystem analog database saved to: {analog_path}")
 
     # Also save as the default file for backward compatibility
     default_analog_path = f"{RESULTS_DIR}/analog_database.json"
-    with open(default_analog_path, "w") as f:
+    with open(default_analog_path, "w", encoding="utf-8") as f:
         json.dump(analog_db, f, indent=2)
 
     # ---------------------------------------------------------------
@@ -373,15 +463,15 @@ def main():
     # ---------------------------------------------------------------
     # 4. Save operational-feasibility report (perf: time + memory)
     # ---------------------------------------------------------------
-    perf["peak_rss_mb"] = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)  # KB -> MB on Linux
+    perf["peak_rss_mb"] = get_peak_rss_mb()  # None if the platform can't report it
 
     perf_path = f"{RESULTS_DIR}/retrieval_perf.json"
     all_perf = {}
     if os.path.exists(perf_path):
-        with open(perf_path) as f:
+        with open(perf_path, encoding="utf-8") as f:
             all_perf = json.load(f)
     all_perf[model_key] = perf
-    with open(perf_path, "w") as f:
+    with open(perf_path, "w", encoding="utf-8") as f:
         json.dump(all_perf, f, indent=2)
 
     print(f"\n  Operational feasibility ({label}):")
@@ -389,7 +479,10 @@ def main():
     for method, m in perf["search"].items():
         print(f"    {method:<10} full leave-one-out sweep: {m['total_time_s']:.3f}s "
               f"({m['avg_query_time_ms']:.3f}ms/query avg)")
-    print(f"    Peak process memory (RSS): {perf['peak_rss_mb']:.1f} MB")
+    if perf["peak_rss_mb"] is not None:
+        print(f"    Peak process memory (RSS): {perf['peak_rss_mb']:.1f} MB")
+    else:
+        print(f"    Peak process memory (RSS): not measurable on this platform")
     print(f"    Saved to: {perf_path}")
 
     print(f"\nDone. Run 07_evaluate_retrieval.py next to evaluate retrieval performance.")

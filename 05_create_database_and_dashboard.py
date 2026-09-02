@@ -31,7 +31,7 @@ def main():
         print(f"Error: Catalog not found at {METADATA_CATALOG_PATH}. Run steps 1-3 first.")
         return
 
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
 
     valid_entries = []

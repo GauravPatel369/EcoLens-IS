@@ -84,7 +84,7 @@ def load_features(path=RISK_FEATURES_PATH):
             f"the cell-year feature table."
         )
     rows = []
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows.append(row)

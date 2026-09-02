@@ -25,7 +25,7 @@ def cosine_similarity(a, b):
 
 
 def main():
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
 
     complete = [e for e in catalog if "prithvi_embedding" in e]

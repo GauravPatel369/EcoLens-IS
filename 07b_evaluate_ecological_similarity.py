@@ -14,7 +14,7 @@ def evaluate_ecological_similarity():
         print(f"Error: Descriptors not found at {desc_path}. Run 09_explainability_engine.py first.")
         return
         
-    with open(desc_path) as f:
+    with open(desc_path, encoding="utf-8") as f:
         descriptors = json.load(f)
         
     retrieval_dir = RESULTS_DIR
@@ -34,7 +34,7 @@ def evaluate_ecological_similarity():
         model_key = rfile.replace("retrieval_results_", "").replace(".json", "")
         label = SUPPORTED_MODELS.get(model_key, {}).get("label", model_key)
         
-        with open(os.path.join(retrieval_dir, rfile)) as f:
+        with open(os.path.join(retrieval_dir, rfile), encoding="utf-8") as f:
             results = json.load(f)
             
         cosine_res = results.get("cosine", {})

@@ -130,9 +130,9 @@ def main():
         print(f"Error: {METADATA_CATALOG_PATH} not found. Run 01-04 first.")
         return
 
-    with open(DESCRIPTORS_PATH) as f:
+    with open(DESCRIPTORS_PATH, encoding="utf-8") as f:
         descriptors = json.load(f)
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
     catalog_lookup = {e["id"]: e for e in catalog}
 
@@ -141,7 +141,7 @@ def main():
     baseline_results = build_spectral_ranking(descriptors, catalog_lookup)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(OUT_PATH, "w") as f:
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(baseline_results, f, indent=2)
     print(f"Saved: {OUT_PATH}")
 
@@ -175,7 +175,7 @@ def main():
         if not os.path.exists(rpath):
             continue
         any_model_found = True
-        with open(rpath) as f:
+        with open(rpath, encoding="utf-8") as f:
             model_results = json.load(f)
         if "cosine" not in model_results:
             continue

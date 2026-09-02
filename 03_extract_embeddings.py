@@ -64,7 +64,7 @@ def load_prithvi_model():
 
     from prithvi_mae import PrithviMAE
 
-    with open(PRITHVI_CONFIG_PATH) as f:
+    with open(PRITHVI_CONFIG_PATH, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
 
     # IMPORTANT: config.yaml's model_args specifies num_frames=3, because
@@ -261,7 +261,7 @@ _clay_metadata_cache = None
 def _load_clay_metadata():
     global _clay_metadata_cache
     if _clay_metadata_cache is None:
-        with open(CLAY_METADATA_PATH) as f:
+        with open(CLAY_METADATA_PATH, encoding="utf-8") as f:
             _clay_metadata_cache = yaml.safe_load(f)
     return _clay_metadata_cache
 
@@ -692,7 +692,7 @@ def main():
     print(f"{SUPPORTED_MODELS[model_key]['description']}")
     print(f"{'='*60}\n")
 
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
 
     if model_key == "prithvi":
@@ -704,7 +704,7 @@ def main():
     else:
         updated_catalog = run_timm_model(catalog, model_key)
 
-    with open(METADATA_CATALOG_PATH, "w") as f:
+    with open(METADATA_CATALOG_PATH, "w", encoding="utf-8") as f:
         json.dump(updated_catalog, f, indent=2)
 
     print(f"\nExtracted and updated catalog file saved to {METADATA_CATALOG_PATH}")

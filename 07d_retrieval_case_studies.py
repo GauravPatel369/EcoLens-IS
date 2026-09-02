@@ -189,17 +189,17 @@ def main():
         print(f"Error: {retrieval_path} not found. Run 06_retrieval_engine.py --model {args.model} first.")
         return
 
-    with open(desc_path) as f:
+    with open(desc_path, encoding="utf-8") as f:
         descriptors = json.load(f)
-    with open(retrieval_path) as f:
+    with open(retrieval_path, encoding="utf-8") as f:
         retrieval_results = json.load(f)
-    with open(METADATA_CATALOG_PATH) as f:
+    with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:
         catalog = json.load(f)
     catalog_lookup = {e["id"]: e for e in catalog}
 
     explanations = {}
     if os.path.exists(explain_path):
-        with open(explain_path) as f:
+        with open(explain_path, encoding="utf-8") as f:
             explanations = json.load(f).get("explanations", {})
 
     label = SUPPORTED_MODELS.get(args.model, {}).get("label", args.model)
@@ -244,7 +244,7 @@ def main():
               f"similarity from imagery alone.\n")
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(OUT_PATH, "w") as f:
+    with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump({args.model: cases}, f, indent=2)
     print(f"Saved case studies to: {OUT_PATH}")
 
