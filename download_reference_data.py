@@ -310,6 +310,10 @@ def main():
     parser.add_argument("--ecoregions", action="store_true")
     parser.add_argument("--worldclim", action="store_true")
     parser.add_argument("--dem", action="store_true")
+    parser.add_argument("--dem-forest-only", action="store_true",
+                        help="Fetch DEM tiles only for forest locations (enough for the "
+                             "risk model in 10/11, but leaves elevation null for every "
+                             "other ecosystem in 09's descriptors).")
     parser.add_argument("--wdpa", action="store_true")
     parser.add_argument("--wdpa-token", default=None, help="Free token from https://api.protectedplanet.net/request")
     parser.add_argument("--wdpa-countries", default=None, help="Comma-separated ISO3 codes, e.g. IND,BRA,COD")
@@ -323,8 +327,20 @@ def main():
         download_worldclim()
     if args.all or args.dem:
         from config import PATCH_LOCATIONS, RISK_FOREST_ECOSYSTEMS
-        forest_locs = [l for l in PATCH_LOCATIONS if l["ecosystem"] in RISK_FOREST_ECOSYSTEMS]
-        download_dem(forest_locs)
+        if args.dem_forest_only:
+            # Enough for the risk model (10/11), which only tiles forest
+            # regions: 31 tiles / ~1.1 GB instead of 148 / ~5.1 GB.
+            locs = [l for l in PATCH_LOCATIONS
+                    if l["ecosystem"] in RISK_FOREST_ECOSYSTEMS]
+            print(f"  (--dem-forest-only: {len(locs)} of {len(PATCH_LOCATIONS)} locations)")
+        else:
+            # Default to every location. 09_explainability_engine.py builds
+            # descriptors for ALL patches, so restricting the DEM to forest
+            # regions -- as this script used to -- left elevation_m and
+            # ruggedness_m null for the other 64 locations, and silently:
+            # geo_lookups returns None for a missing tile rather than erroring.
+            locs = PATCH_LOCATIONS
+        download_dem(locs)
     if args.wdpa:
         countries = args.wdpa_countries.split(",") if args.wdpa_countries else None
         if args.wdpa_token:
