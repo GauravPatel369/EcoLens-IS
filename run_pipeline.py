@@ -32,6 +32,15 @@ def main():
             except Exception as e:
                 print(f"  Warning: could not remove folder {folder}: {e}")
 
+    # 0. Quality control gate. Runs before anything expensive so empty,
+    #    offshore or stale patches are caught before they are embedded
+    #    into results that look perfectly normal. Non-blocking by design:
+    #    it reports and continues, so a known-imperfect catalog can still
+    #    be run deliberately.
+    print()
+    print('>>> Quality control (00_validate_locations.py)')
+    subprocess.run([venv_python, '00_validate_locations.py'], capture_output=False)
+
     # 1. Preprocess patches (will compute custom Sentinel-2 stats now!)
     run_cmd([venv_python, "02_preprocess_patches.py"])
 

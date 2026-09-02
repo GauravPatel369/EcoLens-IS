@@ -10,6 +10,35 @@ satellite view first — this avoids wasting a STAC query on a patch
 that turns out to be the wrong land cover type.
 """
 
+import sys
+
+
+# ---------------------------------------------------------------
+# Windows console encoding
+# ---------------------------------------------------------------
+# This pipeline was developed on Linux, where sys.stdout defaults to
+# UTF-8. On Windows the default is the ANSI code page (cp1252 here),
+# and several scripts print characters outside it -- em dashes in
+# banners (01, run_pipeline) and the degree sign in 07b's temperature
+# output. Printing those to a cp1252 stream raises UnicodeEncodeError.
+#
+# Interactive consoles happen to survive this (Python writes them via
+# WriteConsoleW), which is what makes the bug so easy to miss: it only
+# appears once output is REDIRECTED -- `python 07b_... > log.txt`, a
+# CI job, or any wrapper that captures stdout. run_pipeline.py invokes
+# every stage as a subprocess, so this matters for the full run too.
+#
+# Every script in the pipeline imports config, so reconfiguring here
+# covers all of them from one place. Guarded on platform and on the
+# attribute's existence so it's a no-op everywhere else.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass  # already detached or not reconfigurable; not fatal
+
 
 PATCH_SIZE_PX = 224          # Standard ViT-style input size
 PATCH_SIZE_M = 2240          # 224 px * 10m/px native Sentinel-2 resolution
@@ -35,6 +64,25 @@ AWS_STAC_URL = "https://earth-search.aws.element84.com/v1"
 
 SEARCH_DATE_RANGE = "2024-01-01/2024-06-30"
 MAX_CLOUD_COVER = 15  # percent
+
+# ---------------------------------------------------------------
+# Patch quality control (01_acquire_patches.py)
+# ---------------------------------------------------------------
+# A coordinate can be perfectly cloud-free and still be useless: if it
+# sits offshore, the 2.24 km patch is open water and the embedding
+# describes the sea rather than the ecosystem the label claims. This
+# was a real failure in this catalog -- three "mangrove" locations
+# scored 96-100% water and still fed every retrieval result, because
+# nothing in the pipeline ever looked at patch CONTENT.
+#
+# These thresholds make that failure loud instead of silent. NDWI
+# ( = (green - nir) / (green + nir) ) marks water; a patch above
+# MAX_WATER_FRACTION, or with too many nodata pixels, is rejected and
+# reported. Mangroves and wetlands are legitimately wet, so the bar is
+# set at "almost entirely water", not "any water".
+MAX_WATER_FRACTION = 0.80     # reject if >80% of pixels are water
+MAX_NODATA_FRACTION = 0.20    # reject if >20% of pixels are nodata/zero
+
 
 # ---------------------------------------------------------------
 # 10 proof-of-concept patches across 5 ecosystem categories
@@ -63,7 +111,8 @@ PATCH_LOCATIONS = [
      "name": "Daintree Rainforest, Australia", "protected_area": True, "climatic_region": "Tropical Rainforest"},
     {"id": "forest_010", "ecosystem": "forest", "lon": 11.5000, "lat": -0.5000,
      "name": "Congo Basin Forest, Gabon", "protected_area": False, "climatic_region": "Tropical Rainforest"},
-    {"id": "forest_011", "ecosystem": "forest", "lon": 37.3000, "lat": -0.1500,
+    # CORRECTED 37.3000, -0.1500 -> 37.1500, -0.2000: was the 4596 m summit, above the treeline; moved to the SW montane forest belt
+    {"id": "forest_011", "ecosystem": "forest", "lon": 37.1500, "lat": -0.2000,
      "name": "Mount Kenya Forest, Kenya", "protected_area": True, "climatic_region": "Montane Forest"},
     {"id": "forest_012", "ecosystem": "forest", "lon": 130.5000, "lat": 30.3500,
      "name": "Yakushima Forest, Japan", "protected_area": True, "climatic_region": "Warm Temperate"},
@@ -73,9 +122,11 @@ PATCH_LOCATIONS = [
      "name": "Jiuzhaigou Forest, China", "protected_area": True, "climatic_region": "Montane Deciduous"},
     {"id": "forest_015", "ecosystem": "forest", "lon": -1.0730, "lat": 53.2030,
      "name": "Sherwood Forest, UK", "protected_area": True, "climatic_region": "Temperate Deciduous"},
-    {"id": "forest_016", "ecosystem": "forest", "lon": -105.0000, "lat": 40.0000,
+    # CORRECTED -105.0000, 40.0000 -> -105.6000, 40.3500: was shortgrass prairie 58 km E of the park at 1590 m; moved into Moraine Park
+    {"id": "forest_016", "ecosystem": "forest", "lon": -105.6000, "lat": 40.3500,
      "name": "Rocky Mountain National Park, USA", "protected_area": True, "climatic_region": "Montane Forest"},
-    {"id": "forest_017", "ecosystem": "forest", "lon": 14.5000, "lat": -2.5000,
+    # CORRECTED 14.5000, -2.5000 -> 20.7000, -2.2000: was 690 km W of Salonga in forest-savanna mosaic; moved to the park core
+    {"id": "forest_017", "ecosystem": "forest", "lon": 20.7000, "lat": -2.2000,
      "name": "Salonga National Park, DRC", "protected_area": True, "climatic_region": "Tropical Rainforest"},
 
     # Wetlands (15)
@@ -89,8 +140,9 @@ PATCH_LOCATIONS = [
      "name": "Okavango Delta, Botswana", "protected_area": True, "climatic_region": "Semi-Arid"},
     {"id": "wetland_005", "ecosystem": "wetland", "lon": 132.5000, "lat": -12.5000,
      "name": "Kakadu Wetlands, Australia", "protected_area": True, "climatic_region": "Tropical Monsoon"},
-    {"id": "wetland_006", "ecosystem": "wetland", "lon": 89.5000, "lat": 22.3000,
-     "name": "Sundarbans Freshwater Swamps, Bangladesh", "protected_area": True, "climatic_region": "Tropical Swamps"},
+    # CORRECTED 89.5000, 22.3000 -> 91.0500, 25.1000: sat inside the Sundarbans mangrove biome alongside mangrove_001, making the wetland-vs-mangrove distinction unlearnable; moved to a true freshwater haor
+    {"id": "wetland_006", "ecosystem": "wetland", "lon": 91.0500, "lat": 25.1000,
+     "name": "Tanguar Haor Freshwater Wetland, Bangladesh", "protected_area": True, "climatic_region": "Tropical Swamps"},
     {"id": "wetland_007", "ecosystem": "wetland", "lon": 29.5000, "lat": 45.2500,
      "name": "Danube Delta, Romania", "protected_area": True, "climatic_region": "Temperate Wetland"},
     {"id": "wetland_008", "ecosystem": "wetland", "lon": 4.5000, "lat": 43.5300,
@@ -101,8 +153,9 @@ PATCH_LOCATIONS = [
      "name": "Llanos Swamps, Venezuela", "protected_area": False, "climatic_region": "Tropical Savanna"},
     {"id": "wetland_011", "ecosystem": "wetland", "lon": 48.0000, "lat": 46.0000,
      "name": "Volga Delta, Russia", "protected_area": True, "climatic_region": "Temperate Wetland"},
-    {"id": "wetland_012", "ecosystem": "wetland", "lon": 89.6500, "lat": 22.0500,
-     "name": "Sunderbans Delta Wetlands, Bangladesh", "protected_area": True, "climatic_region": "Tropical Coastal"},
+    # CORRECTED 89.6500, 22.0500 -> 85.3500, 19.7000: duplicated the Sundarbans delta already covered by mangrove_001; moved to Chilika, a distinct brackish lagoon wetland
+    {"id": "wetland_012", "ecosystem": "wetland", "lon": 85.3500, "lat": 19.7000,
+     "name": "Chilika Lake Wetland, India", "protected_area": True, "climatic_region": "Tropical Coastal"},
     {"id": "wetland_013", "ecosystem": "wetland", "lon": -111.5000, "lat": 58.7500,
      "name": "Peace-Athabasca Delta, Canada", "protected_area": True, "climatic_region": "Subarctic"},
     {"id": "wetland_014", "ecosystem": "wetland", "lon": 47.0000, "lat": 31.0000,
@@ -111,27 +164,33 @@ PATCH_LOCATIONS = [
      "name": "Wadden Sea Salt Marshes, Netherlands", "protected_area": True, "climatic_region": "Temperate Coastal"},
     {"id": "wetland_016", "ecosystem": "wetland", "lon": -91.0000, "lat": 30.0000,
      "name": "Atchafalaya Basin, USA", "protected_area": True, "climatic_region": "Humid Subtropical"},
-    {"id": "wetland_017", "ecosystem": "wetland", "lon": -60.0000, "lat": -30.0000,
+    # CORRECTED -60.0000, -30.0000 -> -57.2000, -28.5000: was Humid Chaco 300 km SW; moved to Laguna Ibera
+    {"id": "wetland_017", "ecosystem": "wetland", "lon": -57.2000, "lat": -28.5000,
      "name": "Ibera Wetlands, Argentina", "protected_area": True, "climatic_region": "Humid Subtropical"},
 
     # Mangroves (15)
     {"id": "mangrove_001", "ecosystem": "mangrove", "lon": 88.8500, "lat": 21.9500,
      "name": "Sundarbans, West Bengal, India", "protected_area": True, "climatic_region": "Tropical Wet-and-Dry"},
-    {"id": "mangrove_002", "ecosystem": "mangrove", "lon": -80.1500, "lat": 25.3500,
+    # CORRECTED -80.1500, 25.3500 -> -80.9000, 25.2000: patch measured 96% open water; moved to the Snake Bight mangrove fringe
+    {"id": "mangrove_002", "ecosystem": "mangrove", "lon": -80.9000, "lat": 25.2000,
      "name": "Florida Bay mangroves, USA", "protected_area": True, "climatic_region": "Tropical Wet-and-Dry"},
     {"id": "mangrove_003", "ecosystem": "mangrove", "lon": 6.0000, "lat": 4.5000,
      "name": "Niger Delta Mangroves, Nigeria", "protected_area": False, "climatic_region": "Tropical Coastal"},
-    {"id": "mangrove_004", "ecosystem": "mangrove", "lon": -80.0000, "lat": -2.7500,
+    # CORRECTED -80.0000, -2.7500 -> -79.7000, -2.4300: was inland dry forest at 33 m; moved to Churute mangrove reserve in the estuary
+    {"id": "mangrove_004", "ecosystem": "mangrove", "lon": -79.7000, "lat": -2.4300,
      "name": "Gulf of Guayaquil Mangroves, Ecuador", "protected_area": True, "climatic_region": "Tropical Coastal"},
     {"id": "mangrove_005", "ecosystem": "mangrove", "lon": 79.7820, "lat": 11.4310,
      "name": "Pichavaram Mangroves, India", "protected_area": True, "climatic_region": "Tropical Coastal"},
     {"id": "mangrove_006", "ecosystem": "mangrove", "lon": 86.8500, "lat": 20.6500,
      "name": "Bhitarkanika Mangroves, India", "protected_area": True, "climatic_region": "Tropical Monsoon"},
-    {"id": "mangrove_007", "ecosystem": "mangrove", "lon": 106.7750, "lat": -6.1100,
-     "name": "Muara Angke Mangroves, Indonesia", "protected_area": True, "climatic_region": "Tropical Coastal"},
-    {"id": "mangrove_008", "ecosystem": "mangrove", "lon": 44.2500, "lat": -16.0000,
+    # CORRECTED 106.7750, -6.1100 -> 108.8000, -7.7000: Muara Angke reserve is ~25 ha, far smaller than a 2.24 km patch, so 72% of it was water; swapped for Segara Anakan, a mangrove system larger than the patch footprint
+    {"id": "mangrove_007", "ecosystem": "mangrove", "lon": 108.8000, "lat": -7.7000,
+     "name": "Segara Anakan Mangroves, Indonesia", "protected_area": True, "climatic_region": "Tropical Coastal"},
+    # CORRECTED 44.2500, -16.0000 -> 44.4500, -19.6500: patch measured 100% open water (Mozambique Channel); moved to the Tsiribihina delta
+    {"id": "mangrove_008", "ecosystem": "mangrove", "lon": 44.4500, "lat": -19.6500,
      "name": "Madagascar Mangroves, Madagascar", "protected_area": True, "climatic_region": "Tropical Dry"},
-    {"id": "mangrove_009", "ecosystem": "mangrove", "lon": 34.6000, "lat": 25.0000,
+    # CORRECTED 34.6000, 25.0000 -> 35.0200, 24.2800: was 539 m up in the Red Sea Hills; moved to the Hamata coastal mangroves
+    {"id": "mangrove_009", "ecosystem": "mangrove", "lon": 35.0200, "lat": 24.2800,
      "name": "Red Sea Mangroves, Egypt", "protected_area": True, "climatic_region": "Arid Coastal"},
     {"id": "mangrove_010", "ecosystem": "mangrove", "lon": 145.2500, "lat": -15.4500,
      "name": "Great Barrier Reef Mangroves, Australia", "protected_area": True, "climatic_region": "Tropical Coastal"},
@@ -139,7 +198,8 @@ PATCH_LOCATIONS = [
      "name": "Caroni Swamp Mangroves, Trinidad", "protected_area": True, "climatic_region": "Tropical Coastal"},
     {"id": "mangrove_012", "ecosystem": "mangrove", "lon": -87.5000, "lat": 20.1500,
      "name": "Yucatan Peninsula Mangroves, Mexico", "protected_area": True, "climatic_region": "Tropical Coastal"},
-    {"id": "mangrove_013", "ecosystem": "mangrove", "lon": -16.2000, "lat": 11.8000,
+    # CORRECTED -16.2000, 11.8000 -> -16.0500, 12.3000: patch measured 100% open water (offshore Atlantic); moved to the Rio Cacheu estuary
+    {"id": "mangrove_013", "ecosystem": "mangrove", "lon": -16.0500, "lat": 12.3000,
      "name": "Guinea-Bissau Mangroves, Guinea-Bissau", "protected_area": True, "climatic_region": "Tropical Coastal"},
     {"id": "mangrove_014", "ecosystem": "mangrove", "lon": 100.6200, "lat": 4.8500,
      "name": "Matang Mangrove Forest, Malaysia", "protected_area": True, "climatic_region": "Tropical Coastal"},
@@ -147,7 +207,8 @@ PATCH_LOCATIONS = [
      "name": "Shark Bay Mangroves, Australia", "protected_area": True, "climatic_region": "Semi-Arid Coastal"},
     {"id": "mangrove_016", "ecosystem": "mangrove", "lon": -81.0000, "lat": 24.5000,
      "name": "Key West Mangroves, USA", "protected_area": True, "climatic_region": "Tropical Coastal"},
-    {"id": "mangrove_017", "ecosystem": "mangrove", "lon": 47.5000, "lat": -15.5000,
+    # CORRECTED 47.5000, -15.5000 -> 47.1500, -15.4500: was inland at 84 m; moved into Mahajamba Bay proper
+    {"id": "mangrove_017", "ecosystem": "mangrove", "lon": 47.1500, "lat": -15.4500,
      "name": "Mahajamba Bay Mangroves, Madagascar", "protected_area": True, "climatic_region": "Tropical Dry"},
 
     # Agricultural landscapes (15)
@@ -220,6 +281,11 @@ PATCH_LOCATIONS = [
 # ---------------------------------------------------------------
 
 PATCHES_DIR = "patches"
+# Records the exact coordinates, scene and quality of every patch on disk.
+# Written by 01_acquire_patches.py and read back on the next run to decide
+# whether an existing patch still matches config. catalog.json cannot serve
+# this purpose because step 02 overwrites it with jittered sub-crop entries.
+ACQUISITION_MANIFEST_PATH = f"{PATCHES_DIR}/acquisition_manifest.json"
 METADATA_DIR = "metadata"
 EMBEDDINGS_DIR = "embeddings"
 METADATA_CATALOG_PATH = f"{METADATA_DIR}/catalog.json"
