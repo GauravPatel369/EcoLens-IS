@@ -32,7 +32,7 @@ import json
 import os
 import numpy as np
 
-from config import PATCHES_DIR, METADATA_CATALOG_PATH, PRITHVI_BANDS
+from config import PATCHES_DIR, METADATA_CATALOG_PATH, PRITHVI_BANDS, METADATA_DIR
 
 # Sentinel-2 L2A surface reflectance is stored as uint16, scaled by 10000.
 # i.e. a raw value of 4500 means 0.45 reflectance.
@@ -83,18 +83,50 @@ def to_reflectance(raw_patch):
     return raw_patch / REFLECTANCE_SCALE
 
 
+def nodata_mask(patch, nodata_value=0):
+    """
+    Sentinel-2 L2A marks nodata as a pixel that is zero in EVERY band.
+    A zero in a single band is not nodata -- it is a legitimately dark
+    surface in that wavelength.
+
+    This matters only since the BOA_ADD_OFFSET correction landed. L2A
+    products from processing baseline 04.00 store reflectance with a
+    -1000 DN offset, so 01_acquire_patches.py subtracts it; any surface
+    darker than 0.10 reflectance in a given band then clips to exactly
+    0. Over open water that is most of the blue band -- Mesopotamian
+    Marshes (wetland_014) comes back 98% zero in blue, 88% green, 69%
+    red, 52% NIR, while its SWIR bands are essentially fully valid.
+    Those zeros are the real measurement, not missing data.
+
+    Using the same all-band definition as 01's assess_patch_quality()
+    keeps the two scripts' notion of "nodata" identical, which is what
+    lets 01's nodata_fraction be trusted as a description of what 02
+    will actually see.
+    """
+    return np.all(patch == nodata_value, axis=0)
+
+
 def handle_nodata(patch, nodata_value=0):
     """
-    Replace nodata/zero pixels (common at scene edges or clouds)
-    with the per-band median so they don't distort normalization.
+    Replace true nodata pixels (scene edges) with the per-band median
+    so they don't distort normalization.
+
+    PREVIOUSLY THIS WAS A PER-BAND MASK, AND THAT WAS A FABRICATION BUG.
+    It rewrote every single-band zero, so on a dark-water patch it
+    replaced ~98% of the blue band with the median of the surviving ~2%
+    and emitted a near-constant band. A constant patch matches every
+    other patch at high cosine -- the exact failure that put "Shark Bay
+    Mangroves" atop "Hokkaido Potato Farms" at 0.9997 in the withdrawn
+    run, arrived at by a different route. See implementation.md 3.2.
     """
     clean = patch.copy()
+    mask = nodata_mask(patch, nodata_value)
+    if not mask.any() or mask.all():
+        return clean
+    valid = ~mask
     for b in range(patch.shape[0]):
         band = clean[b]
-        mask = band == nodata_value
-        if mask.any() and not mask.all():
-            median_val = np.median(band[~mask])
-            band[mask] = median_val
+        band[mask] = np.median(band[valid])
     return clean
 
 
@@ -136,13 +168,19 @@ def compute_custom_norm_stats(base_entries):
         if os.path.exists(raw_path):
             patch = np.load(raw_path)
             patch = np.clip(patch, 0, 10000)
+            # Exclude only TRUE nodata (all-band zero), for the same reason
+            # handle_nodata() does -- see nodata_mask()'s docstring. The old
+            # per-band `band_data > 0` filter dropped every legitimately dark
+            # pixel from the statistics, which biased each band's mean upward
+            # by exactly the surfaces the normalization most needs to cover
+            # (water, shadow, burn scars).
+            valid = ~nodata_mask(patch)
             for b in range(6):
-                band_data = patch[b].flatten()
-                non_zero = band_data[band_data > 0]
-                if len(non_zero) > 0:
-                    band_values[b].append(non_zero)
-                else:
+                band_data = patch[b][valid]
+                if band_data.size > 0:
                     band_values[b].append(band_data)
+                else:
+                    band_values[b].append(patch[b].flatten())
 
     means = []
     stds = []
@@ -169,7 +207,7 @@ def main():
             # Reconstruct clean raw entry path references
             raw_entry = entry.copy()
             raw_entry["id"] = base_id
-            raw_entry["patch_path"] = f"patches/{base_id}.npy"
+            raw_entry["patch_path"] = f"data/patches/{base_id}.npy"
             base_entries.append(raw_entry)
 
     # Compute custom mean/std stats directly from the raw Sentinel-2 patches
@@ -177,13 +215,39 @@ def main():
     means, stds = compute_custom_norm_stats(base_entries)
     print(f"Calculated Custom Sentinel-2 norm stats -- means: {list(means)}, stds: {list(stds)}")
 
+    # Persist the stats. They were previously computed, used and thrown away,
+    # which meant anything wanting to embed a NEW patch consistently with the
+    # catalog had to recompute them from all 126 raw patches and hope it matched.
+    # Phase 4 (13_analog_risk_features.py) embeds arbitrary grid cells and
+    # compares them against catalog embeddings, so an identical normalization is
+    # a correctness requirement, not a convenience: feeding raw DN into a model
+    # whose reference vectors came from z-scored input puts the two in different
+    # spaces and every cosine between them is meaningless.
+    stats_path = f"{METADATA_DIR}/norm_stats.json"
+    os.makedirs(METADATA_DIR, exist_ok=True)
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "means": [float(x) for x in means],
+            "stds": [float(x) for x in stds],
+            "bands": list(PRITHVI_BANDS.keys()),
+            "n_base_patches": len(base_entries),
+            "crop_size": 160,
+            "resize_to": 224,
+            "note": "z-score stats computed from the acquired Sentinel-2 patches; "
+                    "excludes all-band-zero nodata pixels. Any patch embedded for "
+                    "comparison against the catalog must use these exact values AND "
+                    "the same 160->224 crop geometry.",
+        }, f, indent=2)
+    print(f"Normalization stats saved to {stats_path}")
+
     processed_dir = f"{PATCHES_DIR}_processed"
     os.makedirs(processed_dir, exist_ok=True)
 
     updated_catalog = []
     crop_size = 160
 
-    print(f"Expanding {len(base_entries)} base patches into 10 deterministic-random sub-crops each (710 total)...")
+    print(f"Expanding {len(base_entries)} base patches into 10 deterministic-random "
+          f"sub-crops each ({len(base_entries) * 10} total)...")
 
     for entry in base_entries:
         raw_path = entry["patch_path"]
@@ -245,10 +309,10 @@ def main():
             sub_entry["processed_shape"] = list(normalized.shape)
 
             # Update model-specific path references
-            sub_entry["embedding_path"] = f"embeddings/{sub_id}.npy"
-            sub_entry["prithvi_embedding"] = f"embeddings/{sub_id}.npy"
-            sub_entry["vit_embedding"] = f"embeddings_vit/{sub_id}.npy"
-            sub_entry["resnet_embedding"] = f"embeddings_resnet/{sub_id}.npy"
+            sub_entry["embedding_path"] = f"data/embeddings/prithvi/{sub_id}.npy"
+            sub_entry["prithvi_embedding"] = f"data/embeddings/prithvi/{sub_id}.npy"
+            sub_entry["vit_embedding"] = f"data/embeddings/vit/{sub_id}.npy"
+            sub_entry["resnet_embedding"] = f"data/embeddings/resnet/{sub_id}.npy"
 
             updated_catalog.append(sub_entry)
 

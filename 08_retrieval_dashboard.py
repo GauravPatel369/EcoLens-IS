@@ -25,6 +25,7 @@ import json
 import os
 import numpy as np
 from config import (
+    DASHBOARDS_DIR,
     METADATA_CATALOG_PATH, EMBEDDINGS_DIR, RESULTS_DIR,
     SUPPORTED_MODELS,
 )
@@ -72,22 +73,63 @@ def compute_model_data(catalog, model_key):
     X_tsne = tsne.fit_transform(X)
 
     # Compute similarity matrices for all three methods
+    # TOP-K ONLY -- this used to embed the FULL similarity matrix (fixed 6 Sep).
+    #
+    # Every query stored a score against every other patch, for three methods, for five
+    # models: 1260 x 1260 x 3 x 5 = 23.8 million numbers serialised as JSON text. The
+    # resulting retrieval_dashboard.html was 1,017,559,769 bytes, and a browser stalls or
+    # silently gives up parsing a ~1 GB script block -- the page looked like it was "not
+    # loading data" when the data was all present and simply unparseable.
+    #
+    # Nothing in the page needs the full matrix: the client groups candidates by base
+    # location, keeps the best sub-crop per location, and renders a top-N. Keeping the top
+    # TOP_K_EMBED per query preserves that exactly. implementation.md 3.4b already flagged
+    # this quadratic serialisation as the real scaling constraint; this is that fix.
+    #
+    # Scores are rounded to 5 dp -- JSON was emitting ~17 significant digits per float,
+    # far below anything the UI can display.
+    # Truncate by DISTINCT BASE LOCATION, not by sub-crop.
+    #
+    # A first attempt kept the top 100 sub-crops per query. That is the wrong unit: the
+    # client groups candidates by base location and keeps the best sub-crop of each, then
+    # renders top-5 and top-15 LOCATION lists. Measured over 200 sampled queries, the top
+    # 100 sub-crops collapsed to a median of only 13 distinct locations (min 10) -- so the
+    # top-15 panel would silently have come up short. Ten sub-crops per location is what
+    # eats the budget.
+    #
+    # Truncating by location instead stores exactly the unit the UI consumes: TOP_N_BASES
+    # locations, each represented by its best-scoring sub-crop. Guarantees the top-15 list
+    # is always full, and is far smaller than any sub-crop cut that could promise the same.
+    # Same-base candidates are dropped here because the client discards them anyway.
+    TOP_N_BASES = 25
+
+    V = np.asarray(vectors, dtype=np.float32)
+    Vn = V / (np.linalg.norm(V, axis=1, keepdims=True) + 1e-8)
+    S_cos = Vn @ Vn.T                                     # cosine, vectorised
+    sq = (V * V).sum(axis=1)
+    D2 = np.maximum(sq[:, None] + sq[None, :] - 2.0 * (V @ V.T), 0.0)
+    S_euc = 1.0 / (1.0 + np.sqrt(D2))                     # same transform as before
+
+    base_of = [i.rsplit("_p", 1)[0] for i in ids]
     sims_cos, sims_euc, sims_knn = {}, {}, {}
-
-    # Pre-compute L2 norms for safe cosine similarity (in case embeddings aren't pre-normalized)
-    norms = [np.linalg.norm(v) for v in vectors]
-
     for i, id_a in enumerate(ids):
-        sims_cos[id_a], sims_euc[id_a], sims_knn[id_a] = {}, {}, {}
-        for j, id_b in enumerate(ids):
-            # Cosine similarity with explicit normalization
-            norm_product = (norms[i] * norms[j]) + 1e-8
-            cs = float(np.dot(vectors[i], vectors[j]) / norm_product)
-            dist = float(np.linalg.norm(vectors[i] - vectors[j]))
-            es = 1.0 / (1.0 + dist)
-            sims_cos[id_a][id_b] = cs
-            sims_euc[id_a][id_b] = es
-            sims_knn[id_a][id_b] = es
+        order = np.argsort(-S_cos[i])
+        best = {}
+        for j in order:
+            b = base_of[j]
+            if b == base_of[i] or b in best:
+                continue
+            best[b] = j
+            if len(best) >= TOP_N_BASES:
+                break
+        keep = list(best.values())
+        sims_cos[id_a] = {ids[j]: round(float(S_cos[i][j]), 5) for j in keep}
+        # euclidean and knn are the same transform of the same distance, and on
+        # L2-normalised vectors they rank identically to cosine (C12) -- so the same
+        # candidate set is correct for all three; only the displayed score differs.
+        e = {ids[j]: round(float(S_euc[i][j]), 5) for j in keep}
+        sims_euc[id_a] = e
+        sims_knn[id_a] = e
 
     dashboard_data = []
     for i, entry in enumerate(valid):
@@ -125,7 +167,10 @@ def compute_model_data(catalog, model_key):
     }
 
 
-def build_html(all_model_data, eval_data, explain_data, model_labels):
+def build_html(all_model_data, eval_data, explain_data, model_labels, forecast_data=None,
+               risk_grid_data=None):
+    forecast_data = forecast_data or {}
+    risk_grid_data = risk_grid_data or {}
     # Use first available model as default
     default_model = list(all_model_data.keys())[0]
 
@@ -187,6 +232,11 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 .badge-mangrove{{background:rgba(6,182,212,.15);color:var(--cyan)}}
 .badge-agricultural{{background:rgba(245,158,11,.15);color:var(--orange)}}
 .badge-urban_green{{background:rgba(236,72,153,.15);color:var(--pink)}}
+.badge-savanna{{background:rgba(234,179,8,.15);color:#eab308}}
+.badge-grassland{{background:rgba(132,204,22,.15);color:#84cc16}}
+.badge-tundra{{background:rgba(165,180,252,.15);color:#a5b4fc}}
+.badge-boreal{{background:rgba(20,184,166,.15);color:#14b8a6}}
+.badge-shrubland{{background:rgba(249,115,22,.15);color:#f97316}}
 .no-sel{{color:var(--t2);text-align:center;font-size:.85rem;padding:30px 0;border:1px dashed var(--border);border-radius:12px}}
 .footer{{margin-top:40px;text-align:center;color:var(--t2);font-size:.75rem;border-top:1px solid var(--border);padding-top:15px}}
 .conf-table{{width:100%;border-collapse:collapse;font-size:.75rem;margin-top:10px}}
@@ -255,6 +305,14 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
     <h2 class="panel-title">Geographic Analog Connections & Clusters</h2>
     <div id="leaflet-map" style="height:400px;width:100%;border-radius:12px;border:1px solid var(--border);background:#0f172a"></div>
   </div>
+
+  <div class="panel" id="riskmap-panel" style="display:none">
+    <h2 class="panel-title">Forest-loss risk across the whole region</h2>
+    <p id="riskmap-sub" style="color:var(--t2);font-size:0.85rem;margin-bottom:6px"></p>
+    <div id="riskmap" style="height:430px;width:100%;border-radius:12px;border:1px solid var(--border);background:#0f172a"></div>
+    <div id="riskmap-legend" style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:12px;font-size:0.72rem;color:var(--t2)"></div>
+    <p id="riskmap-note" style="color:var(--t2);font-size:0.68rem;line-height:1.45;margin-top:10px"></p>
+  </div>
 </div> <!-- End Left Column -->
 
 <div class="panel"> <!-- Right Column -->
@@ -301,8 +359,12 @@ header{{display:flex;justify-content:space-between;align-items:center;margin-bot
 const ALL_MODEL_DATA={json.dumps(all_model_data)};
 const EVAL={json.dumps(eval_data)};
 const EXPLAIN_DATA={json.dumps(explain_data)};
+const FORECASTS={json.dumps(forecast_data)};
+const RISKGRID={json.dumps(risk_grid_data)};
 const MODEL_LABELS={json.dumps(model_labels)};
-const colors={{'forest':'#10b981','wetland':'#3b82f6','mangrove':'#06b6d4','agricultural':'#f59e0b','urban_green':'#ec4899'}};
+// Must cover EVERY category in config.PATCH_LOCATIONS -- the `||'#8b5cf6'` fallbacks
+// below collapse every unlisted category into one purple. Extended 3 Sep for Phase 1.
+const colors={{'forest':'#10b981','wetland':'#3b82f6','mangrove':'#06b6d4','agricultural':'#f59e0b','urban_green':'#ec4899','savanna':'#eab308','grassland':'#84cc16','tundra':'#a5b4fc','boreal':'#14b8a6','shrubland':'#f97316'}};
 const modelColors={{'prithvi':'#8b5cf6','vit':'#3b82f6','resnet':'#f59e0b'}};
 let currentModel='{default_model}';
 let currentMethod='cosine';
@@ -471,6 +533,75 @@ function showComparison(qid, aid, element) {{
   const compMetrics=document.getElementById('comparison-metrics');
   const setQueryBtn=document.getElementById('set-query-btn');
 
+  // ---- Forest-loss risk forecast (Pillar B, surfaced in the UI) --------------
+  // Three states, never collapsed into one:
+  //   * a probability, optionally flagged as out-of-distribution extrapolation
+  //   * "n/a" plus the reason, where there is no tree cover to lose
+  //   * nothing, if 27_location_forecasts.py has not been run
+  // A treeless place must never render as "0 % risk" -- that reads as a confident
+  // safe verdict when the truth is that the question does not apply there.
+  // Render nulls honestly. Interpolating a missing field printed "undefinedm" /
+  // "undefined°C", which reads as a broken page rather than "no data for this point".
+  // Elevation genuinely IS null at some coordinates (DEM tile coverage gap), so the
+  // dash is the correct output there, not a bug to paper over.
+  function fmtNum(v,dp){{
+    return (v===null||v===undefined||Number.isNaN(v)) ? '&mdash;' : Number(v).toFixed(dp);
+  }}
+  function fmtTxt(v){{
+    return (v===null||v===undefined||v==='') ? '&mdash;' : v;
+  }}
+
+  function fcBadge(f){{
+    if(!f) return '<span style="color:var(--t2)" title="No forecast computed for this location.">&mdash;</span>';
+    if(!f.applicable) return '<span style="color:var(--t2);cursor:help" title="'+(f.reason||'').replace(/"/g,'')+'">n/a</span>';
+    const pct=f.risk*100;
+    const col = pct>=50?'var(--pink)' : pct>=20?'var(--orange)' : 'var(--green)';
+    const star = f.extrapolation ? '<span style="color:var(--orange);cursor:help" title="'+(f.reason||'').replace(/"/g,'')+'">*</span>' : '';
+    return '<span style="color:'+col+';font-weight:600">'+pct.toFixed(1)+'%'+star+'</span>';
+  }}
+  function fcHist(f){{
+    if(!f||!f.history) return '<span style="color:var(--t2);font-size:0.6rem">&mdash;</span>';
+    const n=f.history.n_loss_years, ys=f.history.years_since_last_loss;
+    if(!n) return '<span style="color:var(--t2);font-size:0.6rem">no recorded loss</span>';
+    return '<span style="color:var(--t2);font-size:0.6rem">'+n+' loss yr'+(n>1?'s':'')+
+           (ys!=null?', last '+ys+'y ago':'')+'</span>';
+  }}
+
+  function renderForecastRow(qid,aid){{
+    if(!FORECASTS || !FORECASTS.locations) return '';
+    const qf=FORECASTS.locations[qid.split('_p')[0]];
+    const af=FORECASTS.locations[aid.split('_p')[0]];
+    if(!qf && !af) return '';
+    const h=(FORECASTS.summary&&FORECASTS.summary.horizon_years)||2;
+    return '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">'+
+      '<div style="font-size:0.65rem;color:var(--t2);text-transform:uppercase;letter-spacing:1px;margin-bottom:6px">'+
+        'Forest-loss risk &middot; next '+h+' years</div>'+
+      '<div style="display:grid;grid-template-columns:1fr 80px 80px">'+
+        '<span>Chance of <i>any</i> loss</span>'+
+        '<span style="text-align:right">'+fcBadge(qf)+'</span>'+
+        '<span style="text-align:right">'+fcBadge(af)+'</span></div>'+
+      '<div style="display:grid;grid-template-columns:1fr 80px 80px;margin-top:2px">'+
+        '<span style="font-size:0.6rem;color:var(--t2)">Observed history</span>'+
+        '<span style="text-align:right">'+fcHist(qf)+'</span>'+
+        '<span style="text-align:right">'+fcHist(af)+'</span></div>'+
+      '<div style="font-size:0.58rem;color:var(--t2);margin-top:6px;line-height:1.35">'+
+        '<b>How to read this.</b> It is the probability that <i>any</i> tree-cover pixel '+
+        'inside this 1&nbsp;km cell is lost within the horizon &mdash; <b>not</b> the share '+
+        'of forest that disappears. A cell at 20% is not losing a fifth of its trees; it has '+
+        'a 1-in-5 chance of losing <i>some</i>. Typical actual canopy loss where this fires '+
+        'is a few percent. Base rate across all cells: 22%. '+
+        (FORECASTS.summary&&FORECASTS.summary.calibrated
+           ? '<br><span style="color:var(--green)">Probabilities are calibrated</span> '+
+             '(isotonic, fitted on 2019&ndash;20, validated on an untouched 2021 holdout: '+
+             'mean error 19.7% &rarr; 4.1%).'
+           : '<br><span style="color:var(--pink)">Uncalibrated &mdash; inflated ~2-3x. '+
+             'Run 28_calibrate_risk_model.py.</span>')+
+        ' Not a similarity forecast. '+
+        '<b>n/a</b> = nothing here for a tree-cover model to predict (hover). '+
+        '<span style="color:var(--orange)">*</span> = outside the training distribution.'+
+      '</div></div>';
+  }}
+
   const qDesc=EXPLAIN_DATA.descriptors[qid];
   const aDesc=EXPLAIN_DATA.descriptors[aid];
   
@@ -510,34 +641,30 @@ function showComparison(qid, aid, element) {{
     </div>
     <div style="display:grid;grid-template-columns:1fr 80px 80px">
       <span>Altitude (m)</span>
-      <span style="text-align:right">${{qDesc.elevation}}m</span>
-      <span style="text-align:right">${{aDesc.elevation}}m</span>
+      <span style="text-align:right">${{fmtNum(qDesc.elevation_m,0)}}m</span>
+      <span style="text-align:right">${{fmtNum(aDesc.elevation_m,0)}}m</span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 80px 80px">
       <span>Temperature (°C)</span>
-      <span style="text-align:right">${{qDesc.temp}}°C</span>
-      <span style="text-align:right">${{aDesc.temp}}°C</span>
+      <span style="text-align:right">${{fmtNum(qDesc.temp_c,1)}}°C</span>
+      <span style="text-align:right">${{fmtNum(aDesc.temp_c,1)}}°C</span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 80px 80px">
       <span>Rainfall (mm)</span>
-      <span style="text-align:right">${{qDesc.rainfall}}mm</span>
-      <span style="text-align:right">${{aDesc.rainfall}}mm</span>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 80px 80px">
-      <span>Soil Type</span>
-      <span style="text-align:right;font-size:0.65rem;color:var(--t2)">${{qDesc.soil}}</span>
-      <span style="text-align:right;font-size:0.65rem;color:var(--t2)">${{aDesc.soil}}</span>
+      <span style="text-align:right">${{fmtNum(qDesc.rainfall_mm,0)}}mm</span>
+      <span style="text-align:right">${{fmtNum(aDesc.rainfall_mm,0)}}mm</span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 80px 80px;border-bottom:1px solid rgba(255,255,255,0.05);padding-bottom:4px">
       <span>Ecoregion</span>
-      <span style="text-align:right;font-size:0.65rem;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{qDesc.ecoregion}}">${{qDesc.ecoregion}}</span>
-      <span style="text-align:right;font-size:0.65rem;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{aDesc.ecoregion}}">${{aDesc.ecoregion}}</span>
+      <span style="text-align:right;font-size:0.65rem;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{fmtTxt(qDesc.ecoregion)}}">${{fmtTxt(qDesc.ecoregion)}}</span>
+      <span style="text-align:right;font-size:0.65rem;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${{fmtTxt(aDesc.ecoregion)}}">${{fmtTxt(aDesc.ecoregion)}}</span>
     </div>
     <div style="display:grid;grid-template-columns:1fr 80px 80px;padding-top:4px">
       <span>Protected Area</span>
       <span style="text-align:right;color:${{qDesc.protected_area ? 'var(--green)' : 'var(--orange)'}}">${{qDesc.protected_area ? 'Yes' : 'No'}}</span>
       <span style="text-align:right;color:${{aDesc.protected_area ? 'var(--green)' : 'var(--orange)'}}">${{aDesc.protected_area ? 'Yes' : 'No'}}</span>
     </div>
+    ${{renderForecastRow(qid, aid)}}
   `;
 
   // Draw Radar Comparison Chart
@@ -622,6 +749,90 @@ function showComparison(qid, aid, element) {{
   }};
 }}
 
+// NOTE: defined at TOP LEVEL, not inside showComparison().
+// It was originally nested there and called from doSearch(), a different scope --
+// a ReferenceError that aborted doSearch() and silently removed the entire results
+// list along with the map. A grep for the function name still "found" it, which is
+// why string-presence checks are not a substitute for loading the page.
+// ---- Region risk heat-map --------------------------------------------------
+// The forecast row shows ONE 1 km cell -- the site centre. That is a sample, not the
+// forest, and it cannot show the thing that matters most: whether risk is spread evenly
+// or concentrated along a logging front. This draws every cell of the queried region.
+var riskMapInst=null, riskMapLayer=null;
+function riskColor(v){{
+  if(v===null||v===undefined) return '#475569';        // grey = no data, never "safe"
+  // 5 steps rather than a continuous ramp: a reader can match a square to a legend
+  // swatch, which they cannot do with a gradient.
+  if(v<0.10) return '#16a34a';
+  if(v<0.25) return '#84cc16';
+  if(v<0.50) return '#facc15';
+  if(v<0.75) return '#f97316';
+  return '#dc2626';
+}}
+function renderRiskMap(qid){{
+  var panel=document.getElementById('riskmap-panel');
+  if(!RISKGRID || !RISKGRID.regions){{ panel.style.display='none'; return; }}
+  var rid=qid.split('_p')[0];
+  var R=RISKGRID.regions[rid];
+  if(!R){{ panel.style.display='none'; return; }}   // non-forest sites have no grid
+  panel.style.display='block';
+
+  var m=RISKGRID.meta;
+  var pctHigh=(R.n_high_risk/R.n_cells*100);
+  document.getElementById('riskmap-sub').innerHTML =
+    '<b>'+R.name+'</b> &mdash; '+R.n_cells.toLocaleString()+' squares of 1&nbsp;km. '+
+    '<b style="color:'+(pctHigh>=33?'var(--pink)':pctHigh>=10?'var(--orange)':'var(--green)')+'">'+
+    R.n_high_risk.toLocaleString()+'</b> of them ('+pctHigh.toFixed(0)+'%) are above '+
+    (m.high_risk_cutoff*100).toFixed(0)+'% risk. '+
+    'Across the region the model expects <b>~'+Math.round(R.expected_cells_with_loss).toLocaleString()+
+    ' squares</b> to see some tree-cover loss within '+m.horizon_years+' years.';
+
+  if(!riskMapInst){{
+    riskMapInst=L.map('riskmap',{{zoomControl:true,attributionControl:false}});
+    L.tileLayer('https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png',
+                {{maxZoom:19}}).addTo(riskMapInst);
+    riskMapLayer=L.layerGroup().addTo(riskMapInst);
+  }}
+  riskMapLayer.clearLayers();
+
+  var d=0.0045;                                   // ~1 km at these latitudes, in degrees
+  var bounds=[];
+  R.cells.forEach(function(c){{
+    var lat=c[0], lon=c[1], v=c[2];
+    var b=[[lat-d,lon-d],[lat+d,lon+d]];
+    bounds.push([lat,lon]);
+    L.rectangle(b,{{color:riskColor(v),weight:0,fillColor:riskColor(v),
+                   fillOpacity:(v===null?0.25:0.72)}})
+     .bindTooltip((v===null?'no data':(v*100).toFixed(0)+'% chance of some loss')+
+                  '<br><span style="opacity:.7">1 km square &middot; next '+m.horizon_years+' y</span>')
+     .addTo(riskMapLayer);
+  }});
+  // mark the exact cell the forecast row refers to, so the two panels tie together
+  var qf=FORECASTS.locations&&FORECASTS.locations[rid];
+  if(qf){{
+    L.circleMarker([qf.lat,qf.lon],{{radius:7,color:'#ffffff',weight:2,fill:false}})
+     .bindTooltip('The square scored in the report above').addTo(riskMapLayer);
+  }}
+  riskMapInst.invalidateSize();
+  if(bounds.length) riskMapInst.fitBounds(bounds,{{padding:[18,18]}});
+
+  var steps=[['<10%','#16a34a'],['10-25%','#84cc16'],['25-50%','#facc15'],
+             ['50-75%','#f97316'],['>75%','#dc2626'],['no data','#475569']];
+  document.getElementById('riskmap-legend').innerHTML =
+    '<span style="color:var(--t1);font-weight:600">Chance this 1 km square loses <i>any</i> tree cover:</span>'+
+    steps.map(function(t){{
+      return '<span style="display:inline-flex;align-items:center;gap:5px">'+
+             '<span style="width:15px;height:15px;border-radius:3px;background:'+t[1]+';display:inline-block"></span>'+t[0]+'</span>';
+    }}).join('');
+
+  document.getElementById('riskmap-note').innerHTML =
+    '<b>Shade = likelihood, not amount.</b> A red square is not losing 75% of its trees &mdash; '+
+    'it has a 75% chance of losing <i>some</i>. Where loss does happen, typical canopy lost is a few percent. '+
+    '<br><b>Why this matters more than one number:</b> two regions can share an average and look '+
+    'completely different &mdash; risk spread thinly, or concentrated along one front. The map shows which. '+
+    '<br><span style="color:var(--orange)">Caveat:</span> '+m.in_sample_note;
+}}
+
 function doSearch(qid){{
   const md=ALL_MODEL_DATA[currentModel];
   if(!md)return;
@@ -663,6 +874,8 @@ function doSearch(qid){{
 
   // Sort locations by their best matching sub-patch score
   const sorted = Object.values(grouped).sort((a, b) => b.score - a.score);
+
+  renderRiskMap(qid);
 
   // Update Leaflet map with query flyTo and similarity line markers
   document.getElementById('leaflet-map-panel').style.display='block';
@@ -793,9 +1006,58 @@ def main():
     else:
         print(f"Warning: {explain_path} not found. Dashboard will not show comparison explanations.")
 
-    html = build_html(all_model_data, eval_data, explain_data, model_labels)
+    # Trim explanations to pairs the page can actually reach (6 Sep).
+    #
+    # 09 precomputes ~186 analogs per query, which is 95 MB of the embedded payload. The
+    # UI only ever looks up EXPLAIN_DATA.explanations[qid][aid] for an analog the user
+    # clicked, and clickable analogs come from the top-K candidate lists above. Anything
+    # outside the union of those lists is unreachable text.
+    #
+    # The union across ALL models is kept, not one model's, because the model selector
+    # switches candidate sets at runtime -- trimming per-model would blank the explanation
+    # panel after a model switch.
+    if explain_data.get("explanations"):
+        reachable = {}
+        for md in all_model_data.values():
+            for qid, row in md["sims_cos"].items():
+                reachable.setdefault(qid, set()).update(row.keys())
+        before = sum(len(v) for v in explain_data["explanations"].values())
+        explain_data["explanations"] = {
+            qid: {aid: exp for aid, exp in analogs.items() if aid in reachable.get(qid, ())}
+            for qid, analogs in explain_data["explanations"].items()
+        }
+        after = sum(len(v) for v in explain_data["explanations"].values())
+        print(f"Trimmed explanations to reachable pairs: {before:,} -> {after:,}")
 
-    out_path = "retrieval_dashboard.html"
+    # Per-location forecasts (27_location_forecasts.py). Optional: absent file just
+    # omits the panel rather than rendering blanks.
+    forecast_path = f"{RESULTS_DIR}/location_forecasts.json"
+    forecast_data = {}
+    if os.path.exists(forecast_path):
+        with open(forecast_path, encoding="utf-8") as f:
+            forecast_data = json.load(f)
+        sm = forecast_data.get("summary", {})
+        print(f"Loaded forecasts: {sm.get('n_with_forecast')} predicted, "
+              f"{sm.get('n_not_applicable')} n/a, {sm.get('n_extrapolation')} extrapolated.")
+    else:
+        print(f"Note: {forecast_path} not found -- run 27_location_forecasts.py for the "
+              f"risk panel. Building without it.")
+
+    # Per-region risk grids (29_region_risk_map.py) for the heat-map panel.
+    grid_path = f"{RESULTS_DIR}/region_risk_grids.json"
+    risk_grid_data = {}
+    if os.path.exists(grid_path):
+        with open(grid_path, encoding="utf-8") as f:
+            risk_grid_data = json.load(f)
+        print(f"Loaded risk grids: {len(risk_grid_data.get('regions', {}))} regions, "
+              f"{sum(r['n_cells'] for r in risk_grid_data.get('regions', {}).values()):,} cells.")
+    else:
+        print(f"Note: {grid_path} not found -- run 29_region_risk_map.py for the heat map.")
+
+    html = build_html(all_model_data, eval_data, explain_data, model_labels,
+                      forecast_data, risk_grid_data)
+
+    out_path = f"{DASHBOARDS_DIR}/retrieval_dashboard.html"
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
 

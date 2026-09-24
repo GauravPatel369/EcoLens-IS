@@ -31,10 +31,25 @@ from config import (
     SUPPORTED_MODELS, DEFAULT_MODEL, IMAGENET_MEAN, IMAGENET_STD,
 )
 
-PRITHVI_CHECKPOINT_PATH = "Prithvi_100M.pt"
-PRITHVI_CONFIG_PATH = "Prithvi_100M_config.yaml"
+# Model weights live under models/ after the 15 Sep restructure. Anchored via config so a
+# fresh clone downloads them into the same place rather than dropping a 433 MB .pt at the
+# repository root.
+from config import MODELS_DIR
+PRITHVI_CHECKPOINT_PATH = f"{MODELS_DIR}/Prithvi_100M.pt"
+PRITHVI_CONFIG_PATH = f"{MODELS_DIR}/Prithvi_100M_config.yaml"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Skip-if-exists is the default: re-running a model is cheap and resumable
+# after an interrupted run. But it makes this script silently WRONG whenever
+# the catalog has been rebuilt underneath existing embedding files -- the
+# filenames are stable (02 seeds its sub-crop offsets from the base id), so
+# a stale .npy from an older acquisition keeps its name and is silently
+# reused. That is how a run after the 3 Sep re-acquisition extracted only
+# the 80 sub-crops belonging to newly added locations and kept 690 vectors
+# computed before the BOA-offset correction, leaving one index holding two
+# different catalogs. --force re-extracts everything, overwriting in place.
+FORCE_REEXTRACT = False
 
 
 def load_prithvi_model():
@@ -48,15 +63,15 @@ def load_prithvi_model():
 
     if not os.path.exists(PRITHVI_CHECKPOINT_PATH):
         print(f"Downloading {PRITHVI_CHECKPOINT_PATH} from Hugging Face...")
-        hf_hub_download(repo_id=repo_id, filename="Prithvi_100M.pt", local_dir=".")
+        hf_hub_download(repo_id=repo_id, filename="Prithvi_100M.pt", local_dir=MODELS_DIR)
 
     if not os.path.exists(PRITHVI_CONFIG_PATH):
         print(f"Downloading config from Hugging Face...")
-        hf_hub_download(repo_id=repo_id, filename="config.yaml", local_dir=".")
+        hf_hub_download(repo_id=repo_id, filename="config.yaml", local_dir=MODELS_DIR)
         # copy config.yaml to PRITHVI_CONFIG_PATH
-        if os.path.exists("config.yaml") and PRITHVI_CONFIG_PATH != "config.yaml":
+        if os.path.exists(f"{MODELS_DIR}/config.yaml") and PRITHVI_CONFIG_PATH != f"{MODELS_DIR}/config.yaml":
             import shutil
-            shutil.copy("config.yaml", PRITHVI_CONFIG_PATH)
+            shutil.copy(f"{MODELS_DIR}/config.yaml", PRITHVI_CONFIG_PATH)
 
     if not os.path.exists("prithvi_mae.py"):
         print("Downloading prithvi_mae.py from Hugging Face...")
@@ -246,8 +261,8 @@ def extract_timm_embedding(model, rgb_tensor):
 # "nir" (B08), which this project doesn't have -- simply omitted, per
 # Clay's own "any band subset" design, not approximated.)
 
-CLAY_CHECKPOINT_PATH = "clay_checkpoint/clay-v1.5.ckpt"
-CLAY_METADATA_PATH = "clay_checkpoint/metadata.yaml"
+CLAY_CHECKPOINT_PATH = f"{MODELS_DIR}/clay_checkpoint/clay-v1.5.ckpt"
+CLAY_METADATA_PATH = f"{MODELS_DIR}/clay_checkpoint/metadata.yaml"
 CLAY_PLATFORM = "sentinel-2-l2a"
 CLAY_GSD = 10.0
 CLAY_MODEL_SIZE = "large"  # paired with clay-v1.5.ckpt per Clay's own tutorial
@@ -279,17 +294,67 @@ def load_clay_model():
             f"https://raw.githubusercontent.com/Clay-foundation/model/main/configs/metadata.yaml"
         )
 
-    from src.module import ClayMAEModule
+    # Clay's own repo (github.com/Clay-foundation/model) renamed its package
+    # directory from `src/` to `claymodel/` in commit dfcf56b ("Create
+    # package"), which is what a fresh clone gives you today. Older clones --
+    # including the one this pipeline was first built against -- still expose
+    # it as `src`. Try the current name first, fall back to the old one.
+    #
+    # NOTE: this is a MODULE PATH alias only. Both names resolve to the same
+    # real ClayMAEModule; neither branch substitutes a stand-in model. Do not
+    # extend this into a try/except that falls back to some other architecture
+    # -- Clay and Satlas were once mocked with plain ViT/ResNet in this file
+    # and the byte-identical embeddings went unnoticed (see README's
+    # "Known limitations").
+    try:
+        from claymodel.module import ClayMAEModule
+    except ModuleNotFoundError:
+        from src.module import ClayMAEModule
 
-    model = ClayMAEModule.load_from_checkpoint(
-        CLAY_CHECKPOINT_PATH,
-        model_size=CLAY_MODEL_SIZE,
-        metadata_path=CLAY_METADATA_PATH,
-        dolls=[16, 32, 64, 128, 256, 768, 1024],
-        doll_weights=[1, 1, 1, 1, 1, 1, 1],
-        mask_ratio=0.0,   # no masking at inference -- we want the full representation
-        shuffle=False,
-    )
+    # Clay's Model.__init__ builds a DINOv2 ViT-Large "teacher"
+    # (timm.create_model(teacher, pretrained=True), claymodel/model.py:388).
+    # That teacher exists ONLY for the distillation loss during pretraining.
+    # Inference here goes through model.model.encoder (see
+    # extract_clay_embedding), which never touches it.
+    #
+    # Building it with pretrained=True downloads and materialises ~1.2 GB of
+    # DINOv2 weights that load_from_checkpoint then immediately overwrites
+    # with the teacher tensors stored in the checkpoint -- 304.4M of the
+    # checkpoint's 632.8M parameters are model.teacher.*. On a machine with
+    # limited commit charge that download is what tips the load over into
+    # "OSError 1455: The paging file is too small".
+    #
+    # Forcing pretrained=False skips the wasted download/allocation. The
+    # ENCODER weights are unaffected: they still come from the real
+    # clay-v1.5 checkpoint exactly as before. This changes peak memory,
+    # not a single embedding value.
+    _orig_create_model = timm.create_model
+
+    def _create_model_no_pretrained(*args, **kwargs):
+        kwargs["pretrained"] = False
+        return _orig_create_model(*args, **kwargs)
+
+    timm.create_model = _create_model_no_pretrained
+    try:
+        model = ClayMAEModule.load_from_checkpoint(
+            CLAY_CHECKPOINT_PATH,
+            model_size=CLAY_MODEL_SIZE,
+            metadata_path=CLAY_METADATA_PATH,
+            dolls=[16, 32, 64, 128, 256, 768, 1024],
+            doll_weights=[1, 1, 1, 1, 1, 1, 1],
+            mask_ratio=0.0,   # no masking at inference -- we want the full representation
+            shuffle=False,
+            map_location="cpu",
+        )
+    finally:
+        timm.create_model = _orig_create_model
+
+    # Drop the teacher now that the checkpoint is loaded -- it is dead weight
+    # (~1.2 GB) for every patch we embed. Guarded so a future Clay release
+    # that drops the attribute doesn't break this.
+    if hasattr(model.model, "teacher"):
+        del model.model.teacher
+
     model.eval()
     model.to(DEVICE)
     return model
@@ -371,7 +436,7 @@ def run_clay(catalog):
             continue
         out_path = f"{emb_dir}/{entry['id']}.npy"
         entry["clay_embedding"] = out_path
-        if os.path.exists(out_path):
+        if os.path.exists(out_path) and not FORCE_REEXTRACT:
             continue
         entries_to_process.append(entry)
 
@@ -513,7 +578,7 @@ def run_satlas(catalog):
             continue
         out_path = f"{emb_dir}/{entry['id']}.npy"
         entry["satlas_embedding"] = out_path
-        if os.path.exists(out_path):
+        if os.path.exists(out_path) and not FORCE_REEXTRACT:
             continue
         entries_to_process.append(entry)
 
@@ -569,7 +634,7 @@ def run_prithvi(catalog):
         out_path = f"{emb_dir}/{entry['id']}.npy"
         # Always store the embedding path in the entry
         entry["prithvi_embedding"] = out_path
-        if os.path.exists(out_path):
+        if os.path.exists(out_path) and not FORCE_REEXTRACT:
             continue
         entries_to_process.append(entry)
 
@@ -631,7 +696,7 @@ def run_timm_model(catalog, model_key):
         out_path = f"{emb_dir}/{entry['id']}.npy"
         # Always store the embedding path in the entry
         entry[f"{model_key}_embedding"] = out_path
-        if os.path.exists(out_path):
+        if os.path.exists(out_path) and not FORCE_REEXTRACT:
             continue
         entries_to_process.append(entry)
 
@@ -684,12 +749,24 @@ def main():
         choices=list(SUPPORTED_MODELS.keys()),
         help=f"Foundation model to use (default: {DEFAULT_MODEL})",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Re-extract every patch, overwriting existing embedding files. "
+             "Required after the catalog has been rebuilt -- without it, stale "
+             "embeddings from an earlier acquisition are silently reused "
+             "because the sub-crop filenames are unchanged.",
+    )
     args = parser.parse_args()
     model_key = args.model
+
+    global FORCE_REEXTRACT
+    FORCE_REEXTRACT = args.force
 
     print(f"\n{'='*60}")
     print(f"EcoLens Embedding Extraction - {SUPPORTED_MODELS[model_key]['label']}")
     print(f"{SUPPORTED_MODELS[model_key]['description']}")
+    if FORCE_REEXTRACT:
+        print("--force: re-extracting ALL patches, overwriting existing files")
     print(f"{'='*60}\n")
 
     with open(METADATA_CATALOG_PATH, encoding="utf-8") as f:

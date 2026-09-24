@@ -578,13 +578,21 @@ def main():
             patchSelect.appendChild(opt);
         }});
 
-        // Color maps for charts
+        // Color maps for charts.
+        // Must cover EVERY category in config.PATCH_LOCATIONS: anything missing here
+        // falls through to a single grey, so several categories would render as one
+        // indistinguishable colour. Extended 3 Sep for the Phase 1 categories.
         const colors = {{
             'forest': '#10b981',      // Emerald Green
             'wetland': '#3b82f6',     // Blue
             'mangrove': '#06b6d4',    // Cyan
             'agricultural': '#f59e0b',// Amber/Orange
-            'urban_green': '#ec4899'  // Pink
+            'urban_green': '#ec4899', // Pink
+            'savanna': '#eab308',     // Yellow
+            'grassland': '#84cc16',   // Lime
+            'tundra': '#a5b4fc',      // Pale indigo
+            'boreal': '#14b8a6',      // Teal
+            'shrubland': '#f97316'    // Deep orange
         }};
 
         // Render Scatter Plot
@@ -756,7 +764,7 @@ def main():
 </html>
 """
 
-    output_html_path = "embedding_dashboard.html"
+    output_html_path = f"{DASHBOARDS_DIR}/embedding_dashboard.html"
     with open(output_html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
 

@@ -122,10 +122,27 @@ def _load_wdpa():
     # Exclude fully marine protected areas for terrestrial ecosystem
     # queries -- a coastal mangrove point sitting just inside an
     # offshore marine reserve boundary should not register as
-    # "protected" for land-cover purposes. WDPA's MARINE field is
-    # '0' = not marine, '1' = partially marine, '2' = entirely marine.
-    if "MARINE" in gdf.columns:
-        gdf = gdf[gdf["MARINE"] != "2"]
+    # "protected" for land-cover purposes.
+    #
+    # SCHEMA NOTE (fixed 6 Sep). Older WDPA releases encoded this in a
+    # MARINE field ('0' not marine, '1' partly, '2' entirely). The
+    # current release has NO MARINE field -- it uses a three-valued
+    # REALM (Terrestrial / Coastal / Marine). Because the old check was
+    # guarded by `if "MARINE" in gdf.columns`, it silently did NOTHING
+    # on a modern download and admitted wholly marine reserves as
+    # protected land, with no error and no warning. Both spellings are
+    # handled now, and an unrecognised schema warns rather than passing
+    # everything through.
+    if "REALM" in gdf.columns:
+        gdf = gdf[gdf["REALM"] != "Marine"]        # keeps Terrestrial + Coastal
+    elif "MARINE" in gdf.columns:
+        gdf = gdf[gdf["MARINE"] != "2"]            # legacy schema
+    else:
+        warnings.warn(
+            "WDPA layer has neither REALM nor MARINE -- cannot exclude marine "
+            "protected areas, so `protected_area` may be True for points that are "
+            "only inside an offshore reserve. Check the layer's schema."
+        )
 
     _WDPA_GDF = gdf
     return _WDPA_GDF
@@ -241,6 +258,16 @@ def sample_raster_point(raster_path, lon, lat, window=1, nodata_override=None):
         else:
             valid = window_data.flatten()
 
+        # Every pixel in the window was nodata. Without this guard np.mean
+        # returns nan (with a "Mean of empty slice" RuntimeWarning), and nan
+        # then flows into descriptors as if it were a measurement -- it
+        # compares False against every threshold, so a factor silently
+        # vanishes instead of being reported as unavailable. None is this
+        # module's contract for "no data here"; sample_raster_point_stats()
+        # below already does this, and this function should have too.
+        if valid.size == 0:
+            return None
+
         return float(np.mean(valid))
 
 
@@ -308,13 +335,37 @@ def is_protected(lon, lat):
     revisiting if you scale up and protection status becomes a
     load-bearing model feature.
     """
+    from shapely.geometry import Point
+    point = Point(lon, lat)
+
+    # FAST PATH -- spatial-index pushdown (added 6 Sep).
+    #
+    # The original implementation loaded the ENTIRE WDPA layer into memory and ran
+    # `gdf.contains(point)`, an O(n) scan per query. That was tolerable against a
+    # hand-made test layer; against the real WDPA release it is not. The current
+    # terrestrial/designated layer holds 299,473 polygons, so scoring this project's
+    # 8,469 grid cells that way is ~2.5 billion containment tests, and the layer alone
+    # is 4.94 GB to hold resident.
+    #
+    # GeoPackage carries an R-tree, so pyogrio can push a bounding box down to OGR and
+    # return only candidate polygons -- measured at ~0.02 s per query. The exact
+    # `contains` test still runs afterwards, on the handful of candidates: a bbox hit
+    # means the ENVELOPE contains the point, which is necessary but not sufficient.
+    path = WDPA_POLYGONS_PATH
+    if os.path.exists(path) and os.path.splitext(path)[1].lower() in (".gpkg", ".fgb"):
+        try:
+            import pyogrio
+            cand = pyogrio.read_dataframe(path, bbox=(lon, lat, lon, lat))
+            if len(cand) == 0:
+                return False
+            return bool(cand.geometry.contains(point).any())
+        except Exception:
+            pass          # fall through to the in-memory path rather than failing closed
+
     gdf = _load_wdpa()
     if gdf is None:
         return None
 
-    from shapely.geometry import Point
-
-    point = Point(lon, lat)
     hits = gdf[gdf.contains(point)]
     return bool(len(hits) > 0)
 

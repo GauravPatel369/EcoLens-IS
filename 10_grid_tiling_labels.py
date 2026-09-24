@@ -181,16 +181,35 @@ def _find_scene_for_year(stac_catalog, lon, lat, year, buffer_deg=0.05):
     """Best (lowest-cloud) Sentinel-2 scene anywhere within the given
     calendar year -- a whole-year window (not a fixed season) since
     what matters for drift is "the best available look at this cell
-    around this year", not exact seasonal alignment."""
+    around this year", not exact seasonal alignment.
+
+    RETRY WITH BACKOFF (added 5 Sep). A single transient
+    `pystac_client.APIError: Connection aborted / RemoteDisconnected` from the Planetary
+    Computer killed a 2.5-hour drift run at region 6 of 17 and lost all of it, because this
+    was the one STAC call site in the project without a retry -- 01, 12 and 13 all grew one
+    after the same failure. One bad response must cost one scene, not the whole job.
+    """
+    import time
     from config import MAX_CLOUD_COVER
     bbox = [lon - buffer_deg, lat - buffer_deg, lon + buffer_deg, lat + buffer_deg]
-    search = stac_catalog.search(
-        collections=["sentinel-2-l2a"],
-        bbox=bbox,
-        datetime=f"{year}-01-01/{year}-12-31",
-        query={"eo:cloud_cover": {"lt": MAX_CLOUD_COVER}},
-    )
-    items = list(search.items())
+    delay = 3.0
+    for attempt in range(4):
+        try:
+            search = stac_catalog.search(
+                collections=["sentinel-2-l2a"],
+                bbox=bbox,
+                datetime=f"{year}-01-01/{year}-12-31",
+                query={"eo:cloud_cover": {"lt": MAX_CLOUD_COVER}},
+            )
+            items = list(search.items())
+            break
+        except Exception as e:
+            if attempt == 3:
+                print(f"  [Warn] STAC search failed after 4 attempts at "
+                      f"({lon:.4f},{lat:.4f}) {year}: {type(e).__name__}")
+                return None
+            time.sleep(delay)
+            delay *= 2
     if not items:
         return None
     return min(items, key=lambda i: i.properties["eo:cloud_cover"])
@@ -220,14 +239,44 @@ def compute_cell_embedding(lon, lat, year, model_key="prithvi"):
     except Exception:
         return None
 
-    if model_key == "prithvi":
-        tensor = torch.from_numpy(patch).float()
-        emb = ext_mod.extract_embedding(model, tensor)
-    else:
-        rgb_tensor = ext_mod.prepare_rgb_tensor(patch)
-        emb = ext_mod.extract_timm_embedding(model, rgb_tensor)
+    # Delegate to 13.embed_cell -- the single definition of "embed exactly the way 03
+    # built the catalog".
+    #
+    # This function previously fed Prithvi the RAW patch (`torch.from_numpy(patch)`),
+    # while 03 builds Prithvi's catalog vectors from the 02 Z-SCORED patch. That is the
+    # defect that made an Amazon cell score 0.0085 against its own catalog and retrieve
+    # Egyptian farmland (implementation.md 3.2), and the same one found in 12 on 5 Sep.
+    #
+    # For embedding_drift specifically the old code still gave a usable NUMBER, because
+    # drift compares a cell to ITSELF at two dates and both sides took the same wrong
+    # path. But it left a landmine: any future caller comparing these vectors to the
+    # catalog would get garbage, silently. Routing through 13 removes the landmine and
+    # makes drift comparable to everything else.
+    #
+    # Lazy import: 13 imports THIS module (as `tiling()`), so a module-level import here
+    # would be circular.
+    import importlib.util as _ilu
+    import sys as _sys
+    if "_a13" not in _sys.modules:
+        _spec = _ilu.spec_from_file_location("_a13", "13_analog_risk_features.py")
+        _m = _ilu.module_from_spec(_spec)
+        _sys.modules["_a13"] = _m
+        _spec.loader.exec_module(_m)
+    a13 = _sys.modules["_a13"]
 
-    emb = emb.astype(np.float32)
+    means, stds, _ = a13.load_norm_stats()
+    scene_date = None
+    try:
+        scene_date = str(item.properties.get("datetime", ""))[:10] or None
+    except Exception:
+        pass
+
+    try:
+        emb = a13.embed_cell(model, model_key, patch, lon, lat, scene_date, means, stds)
+    except Exception:
+        return None
+
+    emb = np.asarray(emb, dtype=np.float32)
     emb /= np.linalg.norm(emb) + 1e-8
     return emb
 
@@ -421,6 +470,11 @@ def distance_to_prior_loss_m(lossyear_arr, px_x_deg, px_y_deg, lat, obs_year_off
     return float(dist_px[center_row, center_col])
 
 
+# Horizons emitted alongside the native RISK_HORIZON_YEARS label, for C22's
+# temporal-window sensitivity. Cheap: each is one extra threshold on an array already read.
+HORIZON_SWEEP_YEARS = (1, 2, 3, 5)
+
+
 def compute_cell_label_and_features(cell_lon, cell_lat, cell_half_km, tiles, obs_year):
     """
     For one cell and one observation year, compute:
@@ -468,12 +522,31 @@ def compute_cell_label_and_features(cell_lon, cell_lat, cell_half_km, tiles, obs
     horizon_mask = (lossyear_arr > obs_offset) & (lossyear_arr <= obs_offset + RISK_HORIZON_YEARS)
     label = int(horizon_mask.any())
 
+    # ALTERNATE HORIZONS, emitted in the same pass (C22 temporal-window sensitivity).
+    #
+    # Sweeping the horizon looked like it needed one ~75-minute re-run of this script per
+    # setting. It does not: the horizon is only a threshold on `lossyear_arr`, which is
+    # already in hand here, so every horizon costs one extra comparison on an array we have
+    # already read.
+    #
+    # It also must be done HERE and not reconstructed afterwards. 25_horizon_sweep.py tried
+    # to rebuild these labels from 09.get_disturbance_history and its self-check refused the
+    # result: that reader uses a wider footprint than this cell window, giving 75.9 %
+    # agreement and a 49.7 % positive rate against this function's 25.6 %. Same-looking
+    # labels, different population.
+    alt_labels = {
+        f"label_loss_H{H}": int(((lossyear_arr > obs_offset)
+                                 & (lossyear_arr <= obs_offset + H)).any())
+        for H in HORIZON_SWEEP_YEARS
+    }
+
     dist_prior_loss = distance_to_prior_loss_m(lossyear_arr, px_x, px_y, cell_lat, obs_offset)
 
     return {
         "baseline_treecover_pct": round(baseline_treecover_pct, 2),
         "distance_to_prior_loss_m": round(dist_prior_loss, 1) if dist_prior_loss is not None else None,
         "label_loss_within_horizon": label,
+        **alt_labels,
     }
 
 
@@ -538,7 +611,43 @@ def main():
     rows = []
     path_cache = {}      # tile_name -> (treecover_path, lossyear_path)
     dataset_cache = {}   # tile_name -> (treecover_dataset, lossyear_dataset), OPENED ONCE
+    # ---- RESUMABLE DRIFT CACHE (added 5 Sep) -------------------------------------
+    # drift is the expensive part of this script: 2 STAC searches + 2 model forward
+    # passes per cell, ~6 s. It was previously in-memory only, and the whole run wrote
+    # its CSV once at the very end -- so when a transient STAC error killed the 5 Sep run
+    # at region 6 of 17, 2.5 hours of embedding work was unrecoverable. Persisting the
+    # cache makes a restart skip everything already computed, which is what
+    # implementation.md asks of every long job ("trackable, and resumable if interrupted").
+    #
+    # Keyed by coordinate + both years + model, so changing any of them does not silently
+    # reuse the wrong vectors -- the mistake 13's per-model cache already had to fix.
+    # `None` results are cached too: a cell with no cloud-free scene will not find one on
+    # a retry either, and re-searching it costs the same as a real lookup.
+    import json as _json
+    DRIFT_CACHE_PATH = f"{RISK_MODEL_DIR}/drift_cache_{args.drift_model}.json"
+
+    def _dk(lon, lat):
+        return f"{lon:.5f}_{lat:.5f}_{OBS_YEAR_END}_{OBS_YEAR_END - DRIFT_YEARS_BACK}"
+
     drift_cache = {}     # (round(cell_lon,5), round(cell_lat,5)) -> embedding_drift value or None
+    _drift_disk = {}
+    if args.with_embedding_drift and os.path.exists(DRIFT_CACHE_PATH):
+        try:
+            with open(DRIFT_CACHE_PATH, encoding="utf-8") as _f:
+                _drift_disk = _json.load(_f)
+            print(f"Drift cache: resuming with {len(_drift_disk)} cells already computed "
+                  f"({DRIFT_CACHE_PATH})")
+        except Exception:
+            _drift_disk = {}
+
+    def _drift_save():
+        try:
+            os.makedirs(RISK_MODEL_DIR, exist_ok=True)
+            with open(DRIFT_CACHE_PATH, "w", encoding="utf-8") as _f:
+                _json.dump(_drift_disk, _f)
+        except Exception:
+            pass          # caching is an optimisation, never a correctness requirement
+
     n_missing_tiles = 0
     n_drift_computed = 0
     n_drift_failed = 0
@@ -581,9 +690,19 @@ def main():
                 # every obs_year row for that cell.
                 cell_key = (round(cell_lon, 5), round(cell_lat, 5))
                 if compute_drift_here and drift_cells_remaining != 0 and cell_key not in drift_cache:
-                    drift_val = compute_embedding_drift_for_cell(
-                        cell_lon, cell_lat, OBS_YEAR_END, OBS_YEAR_END - DRIFT_YEARS_BACK, args.drift_model
-                    )
+                    dk = _dk(cell_lon, cell_lat)
+                    if dk in _drift_disk:
+                        drift_val = _drift_disk[dk]          # resumed -- no recompute
+                    else:
+                        drift_val = compute_embedding_drift_for_cell(
+                            cell_lon, cell_lat, OBS_YEAR_END,
+                            OBS_YEAR_END - DRIFT_YEARS_BACK, args.drift_model
+                        )
+                        _drift_disk[dk] = drift_val
+                        # checkpoint often: the whole point is that a crash costs one
+                        # cell, not the run.
+                        if len(_drift_disk) % 20 == 0:
+                            _drift_save()
                     drift_cache[cell_key] = drift_val
                     if drift_val is not None:
                         n_drift_computed += 1
@@ -614,6 +733,15 @@ def main():
                         "ruggedness_m": geo["ruggedness_m"],
                         "label_loss_within_horizon": result["label_loss_within_horizon"],
                     }
+                    # Alternate-horizon labels (C22). compute_cell_label_and_features
+                    # returns these, but this row dict is assembled from an explicit key
+                    # list -- so adding them upstream was not enough and the first run
+                    # silently produced a CSV without them. Copy every label_loss_H* key
+                    # rather than naming them, so HORIZON_SWEEP_YEARS stays the one place
+                    # the set of horizons is defined.
+                    for _k, _v in result.items():
+                        if _k.startswith("label_loss_H"):
+                            row[_k] = _v
                     if args.with_embedding_drift:
                         drift_val = drift_cache.get(cell_key)
                         row["embedding_drift"] = "" if drift_val is None else drift_val
@@ -634,9 +762,11 @@ def main():
     print(f"  Negative (stable):              {len(rows) - n_positive}")
     print(f"  Unique Hansen tiles touched: {len(path_cache)}")
     if args.with_embedding_drift:
+        _drift_save()          # final flush, so a completed run is fully resumable too
         print(f"  Embedding drift computed for {n_drift_computed} cell(s), "
               f"failed/unavailable for {n_drift_failed} cell(s) "
               f"(no cloud-free scene found in one of the two years)")
+        print(f"  Drift cache: {len(_drift_disk)} cells on disk -> {DRIFT_CACHE_PATH}")
     if n_missing_tiles:
         print(f"\n  WARNING: {n_missing_tiles} Hansen tile(s) could not be downloaded --")
         print(f"  some cells were skipped as a result. See this script's module")

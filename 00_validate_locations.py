@@ -43,10 +43,22 @@ Without any reference data (always available):
     DUPLICATE  two locations closer than DUPLICATE_KM but labelled as
                different ecosystems, which makes those two classes
                impossible to separate and unfairly punishes the metrics
+    SEASON     patch acquired outside the growing season for its latitude,
+               so a dormant or snow-covered canopy may be standing in for
+               the ecosystem (advisory)
+    HAZE       median blue reflectance above HAZE_BLUE_REFLECTANCE, which
+               means thin haze OR a legitimately bright surface -- these
+               are not separable from one band, so this always needs a
+               human look (advisory)
+
+    CONTENT    patch is declared forest or mangrove but holds almost no
+               vegetation -- judged on the pixels, not on any map
 
 Additionally, once geo_data/ has been downloaded:
     MISLABEL   RESOLVE biome at the coordinate contradicts the declared
-               ecosystem
+               ecosystem (ADVISORY: an ~800-polygon global map cannot
+               adjudicate a 2.24 km patch -- it called Jiuzhaigou a
+               grassland while the imagery showed 58% forest cover)
     ELEVATION  mangrove well above sea level, or wetland improbably high
 """
 
@@ -60,6 +72,8 @@ import numpy as np
 
 from config import (
     PATCH_LOCATIONS, PATCHES_DIR, ACQUISITION_MANIFEST_PATH,
+    HAZE_BLUE_REFLECTANCE, MIN_VEG_NDVI, MIN_VEG_FOREST_PCT,
+    VEGETATED_ECOSYSTEMS,
 )
 
 acquire = import_module("01_acquire_patches")
@@ -86,12 +100,32 @@ EXPECTED_BIOME = {
 }
 
 SEVERITY = {
-    "EMPTY": "ERROR", "WATER": "ERROR", "STALE": "ERROR", "MISLABEL": "ERROR",
+    "EMPTY": "ERROR", "WATER": "ERROR", "STALE": "ERROR",
+    # CONTENT is the ERROR-level label check: a patch declared forest or
+    # mangrove that contains almost no vegetation. It judges the PIXELS.
+    "CONTENT": "ERROR",
+    # MISLABEL was an ERROR and is now advisory, because it judges the
+    # coordinate against RESOLVE's ~800-polygon global biome map, which is
+    # far too coarse to adjudicate a 2.24 km patch. It produced a real false
+    # positive: Jiuzhaigou sits inside a "Montane Grasslands & Shrublands"
+    # ecoregion -- correct for the Tibetan margin as a region -- while the
+    # patch itself measures NDVI 0.52 and 58.5% forest cover. Blocking the
+    # pipeline on a map that disagrees with the imagery is backwards; the
+    # imagery is the evidence. Kept as a WARN because it still catches real
+    # placement errors worth a human look.
+    "MISLABEL": "WARN",
     "MISSING": "WARN", "DUPLICATE": "WARN", "ELEVATION": "WARN",
+    # HAZE and SEASON are advisory by design. Both flag conditions that
+    # degrade a patch without making it wrong, and both overlap with
+    # legitimate ecosystems -- bright desert reads as hazy, and a tundra or
+    # boreal site has no lush month to prefer. Rejecting on either would
+    # quietly delete real data to remove an artefact.
+    "HAZE": "WARN", "SEASON": "WARN",
 }
 
-ORDER = {"EMPTY": 0, "WATER": 1, "STALE": 2, "MISLABEL": 3,
-         "ELEVATION": 4, "MISSING": 5, "DUPLICATE": 6}
+ORDER = {"EMPTY": 0, "WATER": 1, "STALE": 2, "CONTENT": 3, "MISLABEL": 4,
+         "HAZE": 5, "SEASON": 6, "ELEVATION": 7, "MISSING": 8, "DUPLICATE": 9}
+
 
 
 def haversine_km(lon1, lat1, lon2, lat2):
@@ -119,13 +153,56 @@ def try_load_geo():
         gl = import_module("geo_lookups")
     except Exception:
         return None
+    # Probe with a coordinate that is unambiguously ON LAND.
+    #
+    # This used to probe (0.0, 0.0) -- Null Island, open ocean in the Gulf of
+    # Guinea. RESOLVE Ecoregions is a terrestrial dataset with no polygon
+    # there, so the probe always reported "unavailable" and MISLABEL/ELEVATION
+    # were silently skipped even with geo_data/ fully downloaded. The check
+    # could never fire, which is the worst kind of failure: a validator that
+    # reports success because it never ran.
+    #
+    # Probing a configured location instead ties the health check to data the
+    # project actually uses. Fall back to a hardcoded Amazon coordinate if
+    # PATCH_LOCATIONS is somehow empty.
+    if PATCH_LOCATIONS:
+        probe_lon, probe_lat = PATCH_LOCATIONS[0]["lon"], PATCH_LOCATIONS[0]["lat"]
+    else:
+        probe_lon, probe_lat = -60.0261, -3.1019
+
     try:
-        probe = gl.get_physical_descriptors(0.0, 0.0, use_cache=True)
+        probe = gl.get_physical_descriptors(probe_lon, probe_lat, use_cache=True)
     except Exception:
         return None
     if probe.get("ecoregion_source") in (None, "unavailable"):
         return None
     return gl
+
+
+def measure_vegetation(path):
+    """
+    (median NDVI, forest-cover %) for a patch, or None if unreadable.
+
+    Uses the same NDVI/NDWI/NDBI formulas and thresholds as
+    09_explainability_engine.py, so a patch that passes here is described
+    consistently downstream. Relies on 01 having applied BOA_ADD_OFFSET --
+    without it every NDVI reads roughly 0.3 too low and this check would
+    reject healthy forest (Daintree measured 0.57 uncorrected, 0.91
+    corrected).
+    """
+    try:
+        patch = np.load(path).astype(np.float32)
+    except Exception:
+        return None
+
+    green, red, nir, swir1 = patch[1], patch[2], patch[3], patch[4]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ndvi = (nir - red) / (nir + red + 1e-8)
+        ndwi = (green - nir) / (green + nir + 1e-8)
+        ndbi = (swir1 - nir) / (swir1 + nir + 1e-8)
+
+    forest_pct = float(((ndvi > 0.45) & (ndwi < 0.1) & (ndbi < 0.1)).mean() * 100)
+    return float(np.median(ndvi)), forest_pct
 
 
 def check_patch(loc, manifest, findings, unusable):
@@ -138,6 +215,21 @@ def check_patch(loc, manifest, findings, unusable):
 
     rec = manifest.get(pid)
     if rec is not None:
+        month = rec.get("scene_month")
+        if month is not None and not rec.get("growing_season", True):
+            findings.append((
+                "SEASON", pid, loc["name"],
+                "acquired in month {}, outside the growing season for lat {:.1f} -- "
+                "canopy may be dormant".format(month, loc["lat"])))
+
+        blue = rec.get("blue_reflectance")
+        if blue is not None and blue > HAZE_BLUE_REFLECTANCE:
+            findings.append((
+                "HAZE", pid, loc["name"],
+                "median blue reflectance {:.3f} (advisory limit {:.2f}) -- thin haze, "
+                "or a legitimately bright surface; inspect before trusting".format(
+                    blue, HAZE_BLUE_REFLECTANCE)))
+
         moved = (abs(rec.get("lon", 1e9) - loc["lon"]) > 1e-6
                  or abs(rec.get("lat", 1e9) - loc["lat"]) > 1e-6)
         if moved:
@@ -146,6 +238,19 @@ def check_patch(loc, manifest, findings, unusable):
                 "downloaded at ({:.4f}, {:.4f}), config now says ({:.4f}, {:.4f})".format(
                     rec["lon"], rec["lat"], loc["lon"], loc["lat"])))
             unusable.append(path)
+
+    if loc["ecosystem"] in VEGETATED_ECOSYSTEMS:
+        veg = measure_vegetation(path)
+        if veg is not None:
+            ndvi_med, forest_pct = veg
+            if ndvi_med < MIN_VEG_NDVI and forest_pct < MIN_VEG_FOREST_PCT:
+                findings.append((
+                    "CONTENT", pid, loc["name"],
+                    "declared {} but the patch holds almost no vegetation: "
+                    "median NDVI {:.2f} (min {:.2f}), forest cover {:.1f}% "
+                    "(min {:.0f}%)".format(loc["ecosystem"], ndvi_med,
+                                           MIN_VEG_NDVI, forest_pct,
+                                           MIN_VEG_FOREST_PCT)))
 
     try:
         quality = acquire.assess_patch_quality(np.load(path))
