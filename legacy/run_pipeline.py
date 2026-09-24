@@ -22,9 +22,32 @@ def main():
     print("EcoLens Automation Pipeline — Steps 02 to 09 (with Profiling)")
     print("============================================================")
 
-    # 0. Clean old preprocessed patches and embeddings to force complete regeneration
+    # 0. Clean old preprocessed patches and embeddings to force complete regeneration.
+    #
+    # GUARD ADDED 4 Sep (C25 audit). This block used to delete unconditionally, and
+    # setup.py advertised this function as the package's console script -- so the one
+    # command the packaging offered would wipe a large part of the catalog. Worse, the
+    # folder list predates Clay and Satlas, so embeddings_clay/ and embeddings_satlas/
+    # survive: the result is not a clean slate but a SILENTLY INCONSISTENT one, where
+    # some models' vectors match the current patches and others do not.
+    #
+    # Prefer run_phase.py, which is resumable and destroys nothing. If you really do want
+    # a from-scratch rebuild, pass --force and it behaves as before.
+    force = "--force" in sys.argv
+    doomed = ["patches_processed", "embeddings", "embeddings_vit", "embeddings_resnet",
+              "embeddings_clay", "embeddings_satlas"]
+    populated = [f for f in doomed
+                 if os.path.isdir(f) and any(os.scandir(f))]
+    if populated and not force:
+        print("\n  REFUSING TO DELETE a populated catalog.")
+        for f in populated:
+            print(f"    {f}/  ({sum(1 for _ in os.scandir(f))} entries)")
+        print("  Re-running from scratch would discard hours of embedding work.")
+        print("  Use run_phase.py to resume, or pass --force to delete anyway.\n")
+        sys.exit(1)
+
     print("Cleaning up old preprocessed patches and embeddings directories to force regeneration...")
-    for folder in ["patches_processed", "embeddings", "embeddings_vit", "embeddings_resnet"]:
+    for folder in doomed:
         if os.path.exists(folder):
             try:
                 shutil.rmtree(folder)

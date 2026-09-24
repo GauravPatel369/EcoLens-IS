@@ -57,3 +57,22 @@ Thumbs.db
 hansen_data/
 geo_data/
 risk_model
+# ---------------------------------------------------------------------------
+# Restructured layout (15 Sep). Data and outputs are regenerable or huge; they
+# are produced by the pipeline and must not enter version control. The
+# directory skeleton is recreated automatically because every path is derived
+# from config.PROJECT_ROOT and created with os.makedirs(..., exist_ok=True).
+# ---------------------------------------------------------------------------
+
+# Acquired imagery, embeddings and reference datasets (tens of GB)
+data/
+
+# Everything the pipeline produces
+outputs/
+
+# Model weights (downloaded on first run by 03_extract_embeddings.py)
+models/
+
+# Dashboards are large single-file HTML; 05 and 08 regenerate them
+outputs/dashboards/
+*.html
