@@ -823,6 +823,80 @@ GRID_CELL_SIZE_M = 1000          # 1km cells, matched to WorldClim resolution
 GRID_REGION_BUFFER_KM = 15       # radius around each base location to tile
 RISK_FOREST_ECOSYSTEMS = ["forest"]
 
+# ---------------------------------------------------------------
+# RISK-ONLY REGIONS (review comment C5)
+# ---------------------------------------------------------------
+# Extra forest regions used ONLY to train and test the forest-loss model. They are tiled,
+# labelled and scored exactly like the PATCH_LOCATIONS forest entries -- 10_grid_tiling_labels
+# takes nothing but lon/lat from a config entry, and every driver (tree cover, climate,
+# elevation, protection) is looked up live from the global layers.
+#
+# They are deliberately NOT in PATCH_LOCATIONS. Putting them there would make 01/02/03
+# acquire imagery and embed them into the retrieval catalogue, taking forest from 13.5% to
+# 31% of it -- which changes chance precision and therefore the meaning of every Pillar A
+# metric (mAP, the spectral-baseline contrast, the backbone ranking), invalidating results
+# that are already written up. Keeping them separate leaves Pillar A untouched.
+#
+# The cost of that choice: these regions can RETRIEVE the 126 catalogue locations as
+# analogs, but can never BE retrieved as one. The analog pool stays at 1,260 vectors.
+#
+# Populate from 34_generate_risk_regions.py, which writes a reviewed, paste-ready block to
+# outputs/results/candidate_risk_regions.py. Empty list = today's behaviour, 17 regions.
+# Accepted from 34_generate_risk_regions.py on 26 Sep 2026: 33 regions taking the
+# risk model from 17 to 50 forest regions (49 usable leave-one-region-out folds).
+# All 33 verified: mean treecover2000 >= 30% over the 15 km box, >= 500 km from every
+# other region, inside a RESOLVE forest biome, Hansen tile already on disk.
+# selection="auto" marks them as systematically sampled rather than hand-picked --
+# the existing 17 are curated famous forests, and the provenance difference belongs in
+# the data, not in somebody's memory.
+RISK_EXTRA_REGIONS = [
+    {"id": 'forest_018', "ecosystem": 'forest', "lon": 2.488, "lat": 42.8389, "name": 'Northeast Spain and Southern France Mediterranean forests, Palearctic', "protected_area": True, "climatic_region": 'Mediterranean Forests, Woodlands & Scrub', "selection": 'auto'},
+    {"id": 'forest_019', "ecosystem": 'forest', "lon": -97.375, "lat": 19.9553, "name": 'Trans-Mexican Volcanic Belt pine-oak forests, Neotropic', "protected_area": False, "climatic_region": 'Tropical & Subtropical Coniferous Forests', "selection": 'auto'},
+    {"id": 'forest_020', "ecosystem": 'forest', "lon": -107.7695, "lat": 27.9558, "name": 'Sierra Madre Occidental pine-oak forests, Nearctic', "protected_area": False, "climatic_region": 'Tropical & Subtropical Coniferous Forests', "selection": 'auto'},
+    {"id": 'forest_021', "ecosystem": 'forest', "lon": 83.3806, "lat": 27.9312, "name": 'Himalayan subtropical pine forests, Indomalayan', "protected_area": False, "climatic_region": 'Tropical & Subtropical Coniferous Forests', "selection": 'auto'},
+    {"id": 'forest_022', "ecosystem": 'forest', "lon": 141.252, "lat": 42.5809, "name": 'Hokkaido deciduous forests, Palearctic', "protected_area": False, "climatic_region": 'Temperate Broadleaf & Mixed Forests', "selection": 'auto'},
+    {"id": 'forest_023', "ecosystem": 'forest', "lon": 51.252, "lat": 62.4344, "name": 'Scandinavian and Russian taiga, Palearctic', "protected_area": False, "climatic_region": 'Boreal Forests/Taiga', "selection": 'auto'},
+    {"id": 'forest_024', "ecosystem": 'forest', "lon": 141.5883, "lat": -37.9463, "name": 'Naracoorte woodlands, Australasia', "protected_area": False, "climatic_region": 'Mediterranean Forests, Woodlands & Scrub', "selection": 'auto'},
+    {"id": 'forest_025', "ecosystem": 'forest', "lon": -51.4802, "lat": -4.2052, "name": 'Xingu-Tocantins-Araguaia moist forests, Neotropic', "protected_area": True, "climatic_region": 'Tropical & Subtropical Moist Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_026', "ecosystem": 'forest', "lon": 40.8755, "lat": 43.1705, "name": 'Caucasus mixed forests, Palearctic', "protected_area": False, "climatic_region": 'Temperate Broadleaf & Mixed Forests', "selection": 'auto'},
+    {"id": 'forest_027', "ecosystem": 'forest', "lon": 125.1089, "lat": 67.7907, "name": 'Northeast Siberian taiga, Palearctic', "protected_area": False, "climatic_region": 'Boreal Forests/Taiga', "selection": 'auto'},
+    {"id": 'forest_028', "ecosystem": 'forest', "lon": 13.3418, "lat": 57.2926, "name": 'Sarmatic mixed forests, Palearctic', "protected_area": False, "climatic_region": 'Temperate Broadleaf & Mixed Forests', "selection": 'auto'},
+    {"id": 'forest_029', "ecosystem": 'forest', "lon": -65.1608, "lat": -23.9062, "name": 'Southern Andean Yungas, Neotropic', "protected_area": True, "climatic_region": 'Tropical & Subtropical Moist Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_030', "ecosystem": 'forest', "lon": -115.3126, "lat": 52.6597, "name": 'Alberta-British Columbia foothills forests, Nearctic', "protected_area": False, "climatic_region": 'Temperate Conifer Forests', "selection": 'auto'},
+    {"id": 'forest_031', "ecosystem": 'forest', "lon": 104.2935, "lat": -1.8886, "name": 'Sumatran peat swamp forests, Indomalayan', "protected_area": True, "climatic_region": 'Tropical & Subtropical Moist Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_032', "ecosystem": 'forest', "lon": -111.4323, "lat": 34.4269, "name": 'Arizona Mountains forests, Nearctic', "protected_area": False, "climatic_region": 'Temperate Conifer Forests', "selection": 'auto'},
+    {"id": 'forest_033', "ecosystem": 'forest', "lon": -75.942, "lat": 49.3417, "name": 'Central Canadian Shield forests, Nearctic', "protected_area": False, "climatic_region": 'Boreal Forests/Taiga', "selection": 'auto'},
+    {"id": 'forest_034', "ecosystem": 'forest', "lon": 78.6679, "lat": 29.7767, "name": 'Himalayan subtropical pine forests, Indomalayan', "protected_area": False, "climatic_region": 'Tropical & Subtropical Coniferous Forests', "selection": 'auto'},
+    {"id": 'forest_035', "ecosystem": 'forest', "lon": -75.0905, "lat": 5.2771, "name": 'Magdalena Valley montane forests, Neotropic', "protected_area": False, "climatic_region": 'Tropical & Subtropical Moist Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_036', "ecosystem": 'forest', "lon": 129.4038, "lat": 60.7469, "name": 'East Siberian taiga, Palearctic', "protected_area": True, "climatic_region": 'Boreal Forests/Taiga', "selection": 'auto'},
+    {"id": 'forest_037', "ecosystem": 'forest', "lon": 80.7502, "lat": 21.414, "name": 'Central Deccan Plateau dry deciduous forests, Indomalayan', "protected_area": False, "climatic_region": 'Tropical & Subtropical Dry Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_038', "ecosystem": 'forest', "lon": -119.2794, "lat": 34.5685, "name": 'California montane chaparral and woodlands, Nearctic', "protected_area": False, "climatic_region": 'Mediterranean Forests, Woodlands & Scrub', "selection": 'auto'},
+    {"id": 'forest_039', "ecosystem": 'forest', "lon": -119.3848, "lat": 56.8372, "name": 'Alberta-British Columbia foothills forests, Nearctic', "protected_area": False, "climatic_region": 'Temperate Conifer Forests', "selection": 'auto'},
+    {"id": 'forest_040', "ecosystem": 'forest', "lon": 13.918, "lat": 52.2046, "name": 'Central European mixed forests, Palearctic', "protected_area": True, "climatic_region": 'Temperate Broadleaf & Mixed Forests', "selection": 'auto'},
+    {"id": 'forest_041', "ecosystem": 'forest', "lon": 23.6553, "lat": -12.5017, "name": 'Zambezian evergreen dry forests, Afrotropic', "protected_area": False, "climatic_region": 'Tropical & Subtropical Dry Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_042', "ecosystem": 'forest', "lon": 23.5126, "lat": 40.7285, "name": 'Aegean and Western Turkey sclerophyllous and mixed forests, Palearctic', "protected_area": True, "climatic_region": 'Mediterranean Forests, Woodlands & Scrub', "selection": 'auto'},
+    {"id": 'forest_043', "ecosystem": 'forest', "lon": 94.6709, "lat": 23.3223, "name": 'Irrawaddy dry forests, Indomalayan', "protected_area": False, "climatic_region": 'Tropical & Subtropical Dry Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_044', "ecosystem": 'forest', "lon": 175.4132, "lat": -41.4777, "name": 'New Zealand North Island temperate forests, Australasia', "protected_area": False, "climatic_region": 'Temperate Broadleaf & Mixed Forests', "selection": 'auto'},
+    {"id": 'forest_045', "ecosystem": 'forest', "lon": 95.3068, "lat": 29.6725, "name": 'Northeast Himalayan subalpine conifer forests, Palearctic', "protected_area": False, "climatic_region": 'Temperate Conifer Forests', "selection": 'auto'},
+    {"id": 'forest_046', "ecosystem": 'forest', "lon": 90.1263, "lat": 27.5199, "name": 'Eastern Himalayan subalpine conifer forests, Indomalayan', "protected_area": True, "climatic_region": 'Temperate Conifer Forests', "selection": 'auto'},
+    {"id": 'forest_047', "ecosystem": 'forest', "lon": 8.8863, "lat": 41.9346, "name": 'Tyrrhenian-Adriatic sclerophyllous and mixed forests, Palearctic', "protected_area": False, "climatic_region": 'Mediterranean Forests, Woodlands & Scrub', "selection": 'auto'},
+    {"id": 'forest_048', "ecosystem": 'forest', "lon": -109.3725, "lat": 55.8113, "name": 'Mid-Canada Boreal Plains forests, Nearctic', "protected_area": False, "climatic_region": 'Boreal Forests/Taiga', "selection": 'auto'},
+    {"id": 'forest_049', "ecosystem": 'forest', "lon": 107.2811, "lat": 13.4975, "name": 'Central Indochina dry forests, Indomalayan', "protected_area": False, "climatic_region": 'Tropical & Subtropical Dry Broadleaf Forests', "selection": 'auto'},
+    {"id": 'forest_050', "ecosystem": 'forest', "lon": -105.7498, "lat": 23.1596, "name": 'Sierra Madre Occidental pine-oak forests, Nearctic', "protected_area": False, "climatic_region": 'Tropical & Subtropical Coniferous Forests', "selection": 'auto'},
+]
+
+
+def risk_regions():
+    """Every location the risk model tiles: catalogue forest entries + risk-only extras.
+
+    Single source of truth, so 10 (tiling) and anything else that needs the region set
+    cannot drift apart -- the kind of split that let 07b and 07c quietly overwrite each
+    other's output.
+    """
+    return ([loc for loc in PATCH_LOCATIONS
+             if loc.get("ecosystem") in RISK_FOREST_ECOSYSTEMS]
+            + list(RISK_EXTRA_REGIONS))
+
 # Prediction target: was there tree-cover loss within this many years
 # after the observation year, in a Hansen-labeled cell.
 RISK_HORIZON_YEARS = 2

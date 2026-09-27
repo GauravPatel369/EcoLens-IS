@@ -84,7 +84,22 @@ def main():
 
     m = a13()
     ids, bases, plons, plats, pecos, P = m.load_analog_pool(args.model)
-    z = np.load(f"{RESULTS_DIR}/analog_cell_embeddings.npz", allow_pickle=True)
+    # The cell-embedding cache became PER MODEL when it was found that a single shared
+    # file let `--model clay` load Prithvi's vectors and report Clay results computed from
+    # the wrong space. This script still pointed at the old unsuffixed name, so it died with
+    # FileNotFoundError the moment that fix landed -- and, sitting inside run_phase, took
+    # every step after it down with it. Prefer the per-model file; fall back to the legacy
+    # name only if it is still around from an old run.
+    _per_model = f"{RESULTS_DIR}/analog_cell_embeddings_{args.model}.npz"
+    _legacy = f"{RESULTS_DIR}/analog_cell_embeddings.npz"
+    _cache = _per_model if os.path.exists(_per_model) else _legacy
+    if not os.path.exists(_cache):
+        print(f"No cell-embedding cache for '{args.model}'. Looked for:\n"
+              f"  {_per_model}\n  {_legacy}\n"
+              f"Run 13_analog_risk_features.py --model {args.model} first. Skipping.")
+        return
+    print(f"using cell embeddings: {os.path.basename(_cache)}")
+    z = np.load(_cache, allow_pickle=True)
 
     df = pd.read_csv(ANALOG_CSV)
     cells = (df.drop_duplicates(["cell_lon", "cell_lat"])

@@ -51,6 +51,11 @@ OUT_PATH = f"{RESULTS_DIR}/horizon_sweep.json"
 HIST_CACHE = f"{RESULTS_DIR}/cell_loss_history.json"
 HORIZONS = [1, 2, 3, 5]
 NATIVE_HORIZON = 2
+
+# Last year Hansen's lossyear layer records. Mirrors the constant of the same name in
+# 10_grid_tiling_labels.py -- kept local because importing 10 pulls in torch and a STAC
+# client. If the Hansen version is upgraded, change BOTH.
+HANSEN_DATA_THROUGH_YEAR = 2023
 MIN_AGREEMENT = 0.90        # below this the shortcut is not valid; abort rather than mislead
 
 DRIVERS = ["baseline_treecover_pct", "distance_to_prior_loss_m", "temp_c",
@@ -85,10 +90,29 @@ def label_for(hist, lon, lat, obs_year, H):
     return int(any(obs_year < y <= obs_year + H for y in ys))
 
 
-def evaluate(df, label_col):
-    """Temporal split, same cutoff rule as 11; PR-AUC of the best-of-one model."""
+def evaluate(df, label_col, horizon=None):
+    """Temporal split, same cutoff rule as 11; PR-AUC of the best-of-one model.
+
+    RIGHT-CENSORING GUARD (added 26 Sep). label_loss_H{H} at obs_year Y asks "was there loss
+    in Y+1..Y+H", but Hansen only records through HANSEN_DATA_THROUGH_YEAR. For H=5 and
+    obs_year 2021 the window runs to 2026, so four of those five years are unobservable and
+    the label silently collapses to 0 -- a censored negative, not a true one. That biases
+    long horizons toward "no loss" in exactly the most recent rows, and it is why H5 showed
+    the highest PR-AUC (0.7993) of any horizon: a chunk of its negatives are manufactured.
+
+    Rows whose full horizon window is not observable are therefore dropped. H1 and H2 lose
+    nothing (obs_year tops out at 2021); H3 loses 2021; H5 loses 2019-2021.
+    """
     from sklearn.ensemble import HistGradientBoostingClassifier
     from sklearn.metrics import average_precision_score
+    if horizon is not None:
+        n_before = len(df)
+        df = df[df.obs_year + horizon <= HANSEN_DATA_THROUGH_YEAR]
+        if len(df) < n_before:
+            print(f"      dropped {n_before - len(df):,} right-censored rows "
+                  f"(obs_year + {horizon} > {HANSEN_DATA_THROUGH_YEAR})")
+        if df.empty:
+            return None, None, None
     years = sorted(df.obs_year.unique())
     cutoff = years[int(len(years) * 0.8)]
     tr, te = df[df.obs_year <= cutoff], df[df.obs_year > cutoff]
@@ -128,7 +152,7 @@ def main():
     rows = {}
     print(f"\n{'horizon':>8}{'positive rate':>16}{'test rows':>11}{'PR-AUC':>10}{'lift':>9}")
     for H, col in cols.items():
-        ap, posrate, n_te = evaluate(df, col)
+        ap, posrate, n_te = evaluate(df, col, horizon=H)
         if ap is None:
             print(f"  {H:>8}{'  single-class':>16}")
             continue

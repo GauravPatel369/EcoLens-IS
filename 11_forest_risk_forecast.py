@@ -171,12 +171,65 @@ def bootstrap_metric_ci(y_true, y_scores, metric_fn, n_bootstraps=500, ci=95, ra
 
 
 def temporal_train_test_split(X, y, obs_years, train_cutoff_year):
+    """Two-way split. KEPT for the spatial-holdout path, which folds on region, not year.
+
+    Do not use this for the temporal protocol -- see temporal_split_3way for the two leaks
+    it has.
+    """
     train_mask = obs_years <= train_cutoff_year
     test_mask = ~train_mask
     return X[train_mask], y[train_mask], X[test_mask], y[test_mask], train_mask.sum(), test_mask.sum()
 
 
-def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
+def temporal_split_3way(X, y, obs_years, test_start_year, horizon_years, val_span=2):
+    """Leak-free three-way temporal split.
+
+    The old two-way split had two defects, both of which inflated the reported score:
+
+    1. NO EMBARGO. Train was obs_year <= 2018 and the label horizon is 2 years, so the
+       label for obs_year 2018 asks "was there loss in 2019-2020" -- which IS the test
+       period. Training labels therefore contained test-period outcomes. Every obs_year
+       within `horizon_years` of test_start has this problem, so those years are dropped
+       and belong to neither side.
+
+    2. THE MODEL WAS SELECTED ON TEST. Four learners were fit on train, scored on TEST, the
+       best test score kept, and that same number reported as the result. A validation slice
+       carved out of the training years fixes it: selection happens on val, and the test set
+       is touched once, at the end.
+
+    Layout for test_start=2019, horizon=2, val_span=2 over obs_years 2005-2021:
+
+        train 2005-2014 | val 2015-2016 | embargo 2017-2018 | test 2019-2021
+
+    No embargo is placed between train and val. A train label can reach into the val years,
+    which makes SELECTION slightly optimistic -- but selection is not what gets reported,
+    and a second gap would cost two more years out of only seventeen. The gap that matters,
+    train/val -> test, is enforced.
+    """
+    val_end = test_start_year - horizon_years - 1
+    val_start = val_end - val_span + 1
+    train_end = val_start - 1
+
+    train_mask = obs_years <= train_end
+    val_mask = (obs_years >= val_start) & (obs_years <= val_end)
+    test_mask = obs_years >= test_start_year
+    return {
+        "X_train": X[train_mask], "y_train": y[train_mask],
+        "X_val": X[val_mask], "y_val": y[val_mask],
+        "X_test": X[test_mask], "y_test": y[test_mask],
+        "spans": {"train": f"<={train_end}", "val": f"{val_start}-{val_end}",
+                  "embargo": f"{val_end + 1}-{test_start_year - 1}",
+                  "test": f">={test_start_year}"},
+        "n": {"train": int(train_mask.sum()), "val": int(val_mask.sum()),
+              "test": int(test_mask.sum())},
+    }
+
+
+def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label,
+                       X_val=None, y_val=None):
+    """X_val/y_val are the SELECTION set. Passing None falls back to selecting on test and
+    says so loudly -- kept only so the spatial-holdout path, which has no year-based
+    validation slice, can still call this."""
     from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
     from sklearn.metrics import average_precision_score, roc_auc_score, precision_recall_curve
     from sklearn.inspection import permutation_importance
@@ -234,6 +287,9 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
     active_feature_names = [feature_names[i] for i in valid_indices]
     X_train_active = X_train[:, valid_indices]
     X_test_active = X_test[:, valid_indices]
+    X_val_active = X_val[:, valid_indices] if X_val is not None and len(X_val) else None
+    if y_val is None:
+        y_val = np.asarray([], dtype=y_train.dtype)
 
     models_to_try = {
         "HistGradientBoosting": HistGradientBoostingClassifier(class_weight="balanced", max_depth=6, random_state=42),
@@ -250,41 +306,63 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
     best_roc = None
     best_y_scores = None
 
-    print(f"\n  Benchmarking {len(models_to_try)} models:")
-    for m_name, model in models_to_try.items():
+    # SELECTION HAPPENS ON VALIDATION, NEVER ON TEST (fixed 26 Sep).
+    # The old loop scored each learner on X_test/y_test, kept whichever won, and reported
+    # that same score -- so the headline PR-AUC was the maximum of four draws on the test
+    # set, which is optimistic by construction. Now: fit on train, score on val, pick the
+    # winner, refit it on train+val, and touch test exactly once afterwards.
+    has_val = X_val_active is not None and len(y_val) > 0 and len(set(y_val.tolist())) > 1
+    if not has_val:
+        print("\n  WARNING: no usable validation split (empty or single-class). Falling back "
+              "to selecting on test, which is optimistic -- the reported PR-AUC is then an "
+              "upper bound, not an estimate.")
+
+    def _fit_score(m_name, model, Xf, yf, Xs, ys):
+        """Fit on (Xf,yf), return scores on Xs. RandomForest cannot take NaN, so it gets a
+        mean imputer -- fitted on the FIT set only, and returned so the final model can be
+        persisted together with it (a model saved without its imputer breaks at predict)."""
+        imp = None
         if m_name == "RandomForest":
             from sklearn.impute import SimpleImputer
-            imputer = SimpleImputer(strategy="mean")
-            X_train_imp = imputer.fit_transform(X_train_active)
-            X_test_imp = imputer.transform(X_test_active)
-            model.fit(X_train_imp, y_train)
-            y_scores = model.predict_proba(X_test_imp)[:, 1]
-        else:
-            model.fit(X_train_active, y_train)
-            y_scores = model.predict_proba(X_test_active)[:, 1]
-        
-        ap = average_precision_score(y_test, y_scores)
-        try:
-            roc = roc_auc_score(y_test, y_scores)
-        except ValueError:
-            roc = float("nan")
-        
-        print(f"    {m_name:<22} PR-AUC: {ap:.4f}  ROC-AUC: {roc:.4f}")
-        if ap > best_ap:
-            best_ap = ap
-            best_model_name = m_name
-            best_model = model
-            best_roc = roc
-            best_y_scores = y_scores
+            imp = SimpleImputer(strategy="mean")
+            Xf = imp.fit_transform(Xf)
+            Xs = imp.transform(Xs)
+        model.fit(Xf, yf)
+        return model.predict_proba(Xs)[:, 1], imp
 
-    print(f"\n  Best Model: {best_model_name}")
-    print(f"  Average Precision (PR-AUC): {best_ap:.4f}  <- primary metric, class-imbalance-aware")
-    print(f"  ROC-AUC:                    {best_roc:.4f}  <- secondary, can look inflated under imbalance")
+    sel_set = "validation" if has_val else "TEST (fallback)"
+    print(f"\n  Benchmarking {len(models_to_try)} models (selecting on {sel_set}):")
+    best_sel = -1.0
+    best_imputer = None
+    for m_name, model in models_to_try.items():
+        Xs, ys = (X_val_active, y_val) if has_val else (X_test_active, y_test)
+        sel_scores, _ = _fit_score(m_name, model, X_train_active, y_train, Xs, ys)
+        sel_ap = average_precision_score(ys, sel_scores)
+        print(f"    {m_name:<22} {'val' if has_val else 'test'} PR-AUC: {sel_ap:.4f}")
+        if sel_ap > best_sel:
+            best_sel, best_model_name, best_model = sel_ap, m_name, model
 
+    print(f"\n  Selected on {sel_set}: {best_model_name} (PR-AUC {best_sel:.4f})")
+
+    # Refit the winner on train+val so the final model uses every pre-embargo year, then
+    # score test ONCE. Refitting after selection is standard practice and val is not test.
+    if has_val:
+        X_fit = np.vstack([X_train_active, X_val_active])
+        y_fit = np.concatenate([y_train, y_val])
+    else:
+        X_fit, y_fit = X_train_active, y_train
+    y_scores, best_imputer = _fit_score(best_model_name, best_model, X_fit, y_fit,
+                                        X_test_active, y_test)
     model = best_model
-    ap = best_ap
-    roc_auc = best_roc
-    y_scores = best_y_scores
+    ap = best_ap = average_precision_score(y_test, y_scores)
+    try:
+        roc_auc = best_roc = roc_auc_score(y_test, y_scores)
+    except ValueError:
+        roc_auc = best_roc = float("nan")
+
+    print(f"  HELD-OUT TEST, scored once:")
+    print(f"  Average Precision (PR-AUC): {ap:.4f}  <- primary metric, class-imbalance-aware")
+    print(f"  ROC-AUC:                    {roc_auc:.4f}  <- secondary, can look inflated under imbalance")
 
     ap_ci = bootstrap_metric_ci(y_test, y_scores, average_precision_score)
     roc_ci = bootstrap_metric_ci(y_test, y_scores, roc_auc_score)
@@ -306,7 +384,19 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
                 shap_values = shap_values[1]
             plt.figure(figsize=(10, 8))
             shap.summary_plot(shap_values, X_test_active, feature_names=active_feature_names, show=False)
-            safe_label = label.replace(' ', '_').replace('+', 'and')
+            # FILENAME SANITISATION (fixed 26 Sep). The old version replaced only spaces
+            # and '+', so a label like "Ablation: No Climate" produced the path
+            # ".../shap_summary_Ablation:_No_Climate.png". On NTFS everything after a colon
+            # is an ALTERNATE DATA STREAM, so Windows silently created a 0-byte file named
+            # "shap_summary_Ablation" and wrote the plot into a hidden stream on it. Three
+            # of the five SHAP outputs were empty this way -- shap_summary_ARM_1,
+            # shap_summary_ARM_2 and shap_summary_Ablation -- and because savefig raised no
+            # error, review comment C19 looked satisfied while most of its evidence did not
+            # exist. Strip every character Windows forbids in a filename, not just two.
+            safe_label = label.replace('+', 'and')
+            for ch in '<>:"/\\|?*':
+                safe_label = safe_label.replace(ch, '')
+            safe_label = '_'.join(safe_label.split())      # collapse runs of whitespace
             shap_path = f"{RISK_MODEL_DIR}/shap_summary_{safe_label}.png"
             plt.savefig(shap_path, bbox_inches='tight')
             plt.close()
@@ -337,7 +427,15 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label):
         print(f"  (permutation importance skipped: {e})")
 
     return {"model": model, "ap": ap, "roc_auc": roc_auc, "feature_names": active_feature_names,
-            "ap_ci": ap_ci, "roc_auc_ci": roc_ci}
+            "ap_ci": ap_ci, "roc_auc_ci": roc_ci,
+            # the imputer must travel with the model. RandomForest cannot accept NaN, so a
+            # bundle saved without it raises at predict time on the first missing driver --
+            # which is exactly what happened whenever RF won the bake-off.
+            "imputer": best_imputer,
+            "label": label, "selected_model": best_model_name,
+            "selection_set": sel_set, "selection_ap": best_sel,
+            "n_train": int(len(y_train)), "n_val": int(len(y_val)), "n_test": int(len(y_test)),
+            "test_positive_rate": float(y_test.mean()) if len(y_test) else None}
 
 
 def predict_risk(lon, lat, model_path=RISK_MODEL_PATH):
@@ -543,13 +641,29 @@ def main():
         cutoff = args.train_cutoff_year
     else:
         cutoff = all_years[int(len(all_years) * 0.8)] if len(all_years) > 1 else all_years[0]
-    print(f"Years present: {all_years[0]}-{all_years[-1]}. Temporal train/test cutoff: {cutoff} "
-          f"(train: obs_year <= {cutoff}, test: obs_year > {cutoff})")
+    # `cutoff` used to be the last TRAINING year; it is now the year the TEST set starts, so
+    # the embargo can be carved out of the years before it. Same data, explicit boundary.
+    test_start = cutoff + 1
+
+    def split3(rows_, feats):
+        Xa, ya, yrs = build_matrix(rows_, feats)
+        return temporal_split_3way(Xa, ya, yrs, test_start, RISK_HORIZON_YEARS)
+
+    _probe = split3(rows, DRIVER_FEATURES)
+    print(f"Years present: {all_years[0]}-{all_years[-1]}. Three-way temporal split "
+          f"(horizon {RISK_HORIZON_YEARS}y):")
+    print(f"  train {_probe['spans']['train']}  |  val {_probe['spans']['val']}  |  "
+          f"EMBARGO {_probe['spans']['embargo']}  |  test {_probe['spans']['test']}")
+    print(f"  rows: train {_probe['n']['train']:,}  val {_probe['n']['val']:,}  "
+          f"test {_probe['n']['test']:,}")
+    print(f"  the embargo exists because a label at obs_year Y covers Y+1..Y+{RISK_HORIZON_YEARS}; "
+          f"without it, training labels would contain test-period outcomes.")
 
     # --- Driver-only model ---
-    X, y, obs_years = build_matrix(rows, DRIVER_FEATURES)
-    X_train, y_train, X_test, y_test, n_train, n_test = temporal_train_test_split(X, y, obs_years, cutoff)
-    driver_result = train_and_evaluate(X_train, y_train, X_test, y_test, DRIVER_FEATURES, "Driver features only")
+    s = _probe
+    driver_result = train_and_evaluate(s["X_train"], s["y_train"], s["X_test"], s["y_test"],
+                                       DRIVER_FEATURES, "Driver features only",
+                                       X_val=s["X_val"], y_val=s["y_val"])
 
     best_result = driver_result
     best_features = driver_result["feature_names"] if driver_result else None
@@ -557,10 +671,10 @@ def main():
     # --- Driver + embedding-drift model (only if the column is real) ---
     if has_embedding_drift and driver_result is not None:
         feats_with_drift = DRIVER_FEATURES + ["embedding_drift"]
-        X2, y2, obs_years2 = build_matrix(rows, feats_with_drift)
-        X2_train, y2_train, X2_test, y2_test, _, _ = temporal_train_test_split(X2, y2, obs_years2, cutoff)
-        drift_result = train_and_evaluate(X2_train, y2_train, X2_test, y2_test, feats_with_drift,
-                                           "Driver features + embedding drift")
+        s2 = split3(rows, feats_with_drift)
+        drift_result = train_and_evaluate(s2["X_train"], s2["y_train"], s2["X_test"], s2["y_test"],
+                                          feats_with_drift, "Driver features + embedding drift",
+                                          X_val=s2["X_val"], y_val=s2["y_val"])
         if drift_result is not None:
             print(f"\n{'='*70}")
             print("ABLATION RESULT")
@@ -573,6 +687,7 @@ def main():
             if drift_result["ap"] >= driver_result["ap"]:
                 best_result, best_features = drift_result, drift_result["feature_names"]
 
+    group_deltas = {}
     if args.ablation:
         print(f"\n{'='*70}")
         print("ABLATION STUDY: FEATURE GROUPS")
@@ -586,12 +701,15 @@ def main():
         for group_name, feats_to_drop in feature_groups.items():
             ablated_features = [f for f in DRIVER_FEATURES if f not in feats_to_drop]
             print(f"\nDropping {group_name} features ({feats_to_drop}):")
-            X_abl, y_abl, obs_years_abl = build_matrix(rows, ablated_features)
-            X_abl_train, y_abl_train, X_abl_test, y_abl_test, _, _ = temporal_train_test_split(X_abl, y_abl, obs_years_abl, cutoff)
-            res = train_and_evaluate(X_abl_train, y_abl_train, X_abl_test, y_abl_test, ablated_features, f"Ablation: No {group_name}")
+            sa = split3(rows, ablated_features)
+            res = train_and_evaluate(sa["X_train"], sa["y_train"], sa["X_test"], sa["y_test"],
+                                     ablated_features, f"Ablation: No {group_name}",
+                                     X_val=sa["X_val"], y_val=sa["y_val"])
             if res and driver_result:
                 delta = res['ap'] - driver_result['ap']
                 print(f"  => Impact of dropping {group_name}: PR-AUC delta {delta:+.4f}")
+                group_deltas[group_name] = {"pr_auc": res["ap"], "delta": delta,
+                                            "dropped": feats_to_drop}
 
     if best_result is None:
         print("\nNo model could be trained -- see warnings above. Not saving a model file.")
@@ -599,8 +717,46 @@ def main():
 
     import joblib
     os.makedirs(RISK_MODEL_DIR, exist_ok=True)
-    joblib.dump({"model": best_result["model"], "feature_names": best_features}, RISK_MODEL_PATH)
+    joblib.dump({"model": best_result["model"], "feature_names": best_features,
+                 # imputer travels with the model -- see train_and_evaluate's return comment
+                 "imputer": best_result.get("imputer"),
+                 "selected_model": best_result.get("selected_model")}, RISK_MODEL_PATH)
     print(f"\nBest model saved to: {RISK_MODEL_PATH}")
+
+    # ---- METRICS TO JSON (added 26 Sep) ---------------------------------------------
+    # These numbers were previously printed and nowhere else. The project's primary metric
+    # therefore existed only inside outputs/logs/11_*.log: 30_collect could not pick it up,
+    # the report tables had to regex-scrape a log file, and deleting the log would have lost
+    # the headline result until a full re-run. Write it as data.
+    import json
+    metrics = {
+        "generated": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        "protocol": "three-way temporal split with embargo; model selected on validation",
+        "horizon_years": RISK_HORIZON_YEARS,
+        "test_start_year": test_start,
+        "spans": _probe["spans"],
+        "row_counts": _probe["n"],
+        "arms": {},
+        "feature_group_ablation": group_deltas or None,
+    }
+    for res in (driver_result, locals().get("drift_result")):
+        if not res:
+            continue
+        metrics["arms"][res["label"]] = {
+            "pr_auc": res["ap"], "roc_auc": res["roc_auc"],
+            "pr_auc_ci95": list(res["ap_ci"]) if res.get("ap_ci") else None,
+            "roc_auc_ci95": list(res["roc_auc_ci"]) if res.get("roc_auc_ci") else None,
+            "selected_model": res["selected_model"],
+            "selected_on": res["selection_set"],
+            "selection_pr_auc": res["selection_ap"],
+            "n_train": res["n_train"], "n_val": res["n_val"], "n_test": res["n_test"],
+            "test_positive_rate": res["test_positive_rate"],
+            "features": res["feature_names"],
+        }
+    metrics_path = f"{RISK_MODEL_DIR}/risk_model_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics written to: {metrics_path}")
     print(f"Score a location with:")
     print(f"    python 11_forest_risk_forecast.py --predict <lon> <lat>")
 

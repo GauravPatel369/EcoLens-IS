@@ -124,7 +124,33 @@ def main():
         if wanted is not None and e["ecosystem"] not in wanted:
             continue
         locations.append({"base_id": base, "name": e["name"], "ecosystem": e["ecosystem"],
-                          "lon": e["lon"], "lat": e["lat"]})
+                          "lon": e["lon"], "lat": e["lat"], "source": "catalogue"})
+
+    # RISK-ONLY REGIONS (added 27 Sep). The catalogue holds only the 126 locations that have
+    # imagery and embeddings. config.RISK_EXTRA_REGIONS adds forest regions that the risk
+    # model is trained and tested on but which were deliberately kept OUT of the retrieval
+    # catalogue, so that adding them could not shift forest's share of it and thereby change
+    # what every Pillar A metric means. The forecaster needs nothing from the catalogue --
+    # it takes lon/lat and looks every driver up live -- so those regions can be scored here
+    # exactly like any other. Without this the heat maps covered 50 regions while this panel
+    # covered 17, from the same model.
+    try:
+        from config import risk_regions
+        for loc in risk_regions():
+            if loc["id"] in seen:
+                continue
+            if wanted is not None and loc.get("ecosystem") not in wanted:
+                continue
+            seen.add(loc["id"])
+            locations.append({"base_id": loc["id"], "name": loc["name"],
+                              "ecosystem": loc["ecosystem"],
+                              "lon": loc["lon"], "lat": loc["lat"],
+                              "source": "risk-only (not in retrieval catalogue)"})
+    except ImportError:
+        pass
+    n_extra = sum(1 for l in locations if l["source"].startswith("risk-only"))
+    if n_extra:
+        print(f"  + {n_extra} risk-only region(s) beyond the retrieval catalogue")
 
     print(f"\n{'='*78}")
     print(f"PER-LOCATION FOREST-LOSS FORECASTS  (horizon {RISK_HORIZON_YEARS} y)")

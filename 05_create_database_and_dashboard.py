@@ -15,7 +15,11 @@ import json
 import os
 import numpy as np
 
-from config import METADATA_CATALOG_PATH, EMBEDDINGS_DIR
+# DASHBOARDS_DIR was missing from this import and is used at the very end of main() to build
+# the output path -- so the script did all its work, printed its statistics, and then died on
+# a NameError before writing anything. run_phase recorded it as "done(no art)": step finished,
+# artifact absent. Introduced when outputs/ was reorganised into subdirectories.
+from config import METADATA_CATALOG_PATH, EMBEDDINGS_DIR, DASHBOARDS_DIR
 
 
 def cosine_similarity(a, b):

@@ -430,7 +430,22 @@ def _read_window_from_open_dataset(src, min_lon, min_lat, max_lon, max_lat):
     window = window.round_offsets().round_lengths()
     if window.width <= 0 or window.height <= 0:
         return None, None, None
-    arr = src.read(1, window=window)
+    # A TRUNCATED TILE MUST NOT KILL THE RUN (added 27 Sep). A partially-downloaded Hansen
+    # GeoTIFF raises RasterioIOError ("TIFFFillStrip: Read error at scanline 4294967295;
+    # got 0 bytes") only when a read touches the damaged strip -- so the file opens fine,
+    # serves thousands of reads, and then throws deep inside a loop. That killed stage 13
+    # three hours in, after every one of its 3,417 Sentinel-2 embeddings had already been
+    # computed, because one bad tile among 183 was reached at 38% of the feature-building
+    # pass. Callers already handle a None array as "no data for this cell", which is the
+    # honest outcome: one cell is skipped and named, instead of the whole job dying or --
+    # worse -- a zero being silently substituted for missing forest-loss data.
+    try:
+        arr = src.read(1, window=window)
+    except Exception as e:
+        name = os.path.basename(getattr(src, "name", "?"))
+        print(f"  [Warn] unreadable window in {name} ({type(e).__name__}); "
+              f"cell skipped. Delete that tile to force a re-download.")
+        return None, None, None
     px_x = src.transform.a
     px_y = -src.transform.e
     return arr, px_x, px_y
@@ -586,7 +601,11 @@ def main():
                               f"path for a bounded demo run so it doesn't overwrite the full dataset.")
     args = parser.parse_args()
 
-    forest_locations = [loc for loc in PATCH_LOCATIONS if loc["ecosystem"] in RISK_FOREST_ECOSYSTEMS]
+    # config.risk_regions() = catalogue forest entries + config.RISK_EXTRA_REGIONS, the
+    # risk-only regions added for review comment C5. Both kinds are processed identically
+    # from here on: this loop takes only lon/lat, and every driver is a live lookup.
+    from config import risk_regions
+    forest_locations = risk_regions()
     if args.locations_limit is not None:
         forest_locations = forest_locations[:args.locations_limit]
 

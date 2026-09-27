@@ -58,6 +58,22 @@ import math
 import os
 import sys
 
+# ---- NETWORK TIMEOUTS (added 27 Sep) ----------------------------------------------------
+# GDAL applies NO timeout to HTTP range reads by default, and pystac_client's session has
+# none either. One stalled connection to Planetary Computer therefore blocks forever: this
+# script hung for 6 h 19 m at cell 193 of 318, process alive, not one byte written to its
+# log. The stall happened inside the ThreadPoolExecutor, and because results are collected
+# with pool.map the whole chunk waited on that one dead thread -- so the entire job froze
+# instead of losing a single cell.
+#
+# Set before rasterio/GDAL is imported anywhere so the driver picks them up at init.
+# Generous but finite: a real six-band read takes ~20 s, so 120 s means "this connection is
+# dead", not "this connection is slow".
+os.environ.setdefault("GDAL_HTTP_TIMEOUT", "120")
+os.environ.setdefault("GDAL_HTTP_CONNECTTIMEOUT", "30")
+os.environ.setdefault("GDAL_HTTP_MAX_RETRY", "3")
+os.environ.setdefault("GDAL_HTTP_RETRY_DELAY", "2")
+
 import numpy as np
 
 from config import (
@@ -343,6 +359,18 @@ def edge_density(lon, lat):
     return float((h_edges.sum() + v_edges.sum()) / total)
 
 
+def _clip_hist(h, obs_year):
+    """Drop loss years after obs_year.
+
+    Any feature derived from a disturbance history has to be built only from what was
+    observable at prediction time. Returns None unchanged so callers keep their
+    "no history available" path.
+    """
+    if h is None:
+        return None
+    return {y: p for y, p in h.items() if y <= obs_year}
+
+
 def trajectory_jaccard(cell_hist, analog_hists):
     """Mean Jaccard over loss-year sets.
 
@@ -393,6 +421,22 @@ def main():
                          "feature is leakage.")
     ap.add_argument("--embed-year", type=int, default=2021,
                     help="imagery year used to embed each cell")
+    ap.add_argument("--retry-failed", action="store_true",
+                    help="re-attempt cells previously recorded as unembeddable. Off by "
+                         "default so a resumed run does not spend its first hour failing "
+                         "the same fetches again.")
+    ap.add_argument("--random-analogs", action="store_true",
+                    help="CONTROL ARM: pick analogs at random from the allowed pool instead "
+                         "of by similarity. Everything else -- leakage guards, top-k, the 8 "
+                         "feature columns, the horizon windows -- is identical, so comparing "
+                         "this against the real run isolates whether SIMILARITY matters or "
+                         "whether any 8 extra columns would have helped. Writes to a "
+                         "_randctrl suffixed file so it never overwrites the real features.")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="threads used for the Sentinel-2 windowed reads. The fetch is "
+                         "~99%% network wait (measured: 21-33 s per cell, of which the "
+                         "forward pass is 0.28 s), so this scales nearly linearly. Only "
+                         "the reads are threaded; STAC search and the model stay serial.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -423,6 +467,14 @@ def main():
     # ---- resumable embedding cache ----
     CACHE = cache_path(args.model)
     OUT = out_path(args.model)
+    # The control arm must never overwrite the real features -- 14 reads these files by name,
+    # and a clobbered analog_cell_features.csv would silently turn the headline result into
+    # the control result with no visible sign.
+    _rand_ctrl = np.random.default_rng(args.seed + 991)
+    if args.random_analogs:
+        OUT = OUT.replace(".csv", "_randctrl.csv")
+        print("*** RANDOM-ANALOG CONTROL ARM: analogs drawn at random, not by similarity ***")
+        print(f"*** writing to {OUT} ***")
     # one-time migration: the pre-fix unsuffixed cache holds PRITHVI vectors only
     if args.model == "prithvi" and not os.path.exists(CACHE) and os.path.exists(LEGACY_CACHE):
         import shutil
@@ -438,7 +490,21 @@ def main():
         return f"{lon:.5f}_{lat:.5f}"
 
     tl = tiling()
-    todo = [r for r in picked.itertuples() if ckey(r.cell_lon, r.cell_lat) not in cache]
+    # Cells already known to be unembeddable are skipped: they have no cloud-free scene or no
+    # readable bands, and retrying them each run costs the same failures again. --retry-failed
+    # forces another attempt (worth it after a long gap, since new imagery keeps arriving).
+    unembeddable = set()
+    _up = f"{RESULTS_DIR}/analog_cells_unembeddable_{args.model}.json"
+    if os.path.exists(_up) and not args.retry_failed:
+        try:
+            unembeddable = set(json.load(open(_up, encoding="utf-8")))
+            print(f"skipping {len(unembeddable)} cell(s) previously found unembeddable "
+                  f"(--retry-failed to try again)")
+        except Exception:
+            unembeddable = set()
+    todo = [r for r in picked.itertuples()
+            if ckey(r.cell_lon, r.cell_lat) not in cache
+            and ckey(r.cell_lon, r.cell_lat) not in unembeddable]
     print(f"cells needing embedding: {len(todo)}")
 
     if todo:
@@ -451,35 +517,135 @@ def main():
             model = ex.load_satlas_model()
         else:
             model = tl._get_drift_model(args.model)
-        stac = tl._get_drift_stac_catalog()
         from tqdm import tqdm
-        n_ok = n_fail = 0
-        for i, r in enumerate(tqdm(todo, desc="embedding cells")):
-            item = find_scene_resilient(tl, stac, r.cell_lon, r.cell_lat, args.embed_year)
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        # ---- THREADED FETCH; THE PER-CELL SCENE SEARCH IS PRESERVED ----------------
+        # Measured cost per cell: 21-33 s, of which the model forward pass is 0.28 s. The
+        # rest is one STAC search plus six windowed HTTPS reads, so this loop is ~99%
+        # network wait and threads recover most of it.
+        #
+        # An earlier version of this block ALSO resolved one scene per region rather than
+        # per cell, which is ~18% faster again. It was reverted on purpose: the region
+        # scene is not always the scene a per-cell search would choose, so cells would be
+        # embedded from different imagery and the resulting vectors would no longer match
+        # the ones already in the cache. The analog ablation rests on those vectors, so the
+        # speedup would have cost a re-run of the project's central result to save ~25
+        # minutes. Keeping the per-cell search means embeddings are unchanged.
+        #
+        # pystac_client wraps a requests.Session that is not documented as thread-safe, and
+        # 10._get_drift_stac_catalog() memoises ONE client in a module global -- so calling
+        # it from every worker would share that single session. Each thread builds its own.
+        _local = threading.local()
+
+        def thread_stac():
+            if not hasattr(_local, "stac"):
+                import planetary_computer
+                import pystac_client
+                from config import PC_STAC_URL
+                _local.stac = pystac_client.Client.open(
+                    PC_STAC_URL, modifier=planetary_computer.sign_inplace)
+            return _local.stac
+
+        acq_mod = acq()          # pre-warm the lazy module import before threads touch it
+
+        def fetch(r):
+            """Scene search + windowed read for one cell. Runs in a worker thread.
+
+            Returns (raw_patch, scene_date), or (None, None) when there is no cloud-free
+            scene or a band read fails -- the caller counts those as failures rather than
+            fabricating a vector.
+            """
+            item = find_scene_resilient(tl, thread_stac(), r.cell_lon, r.cell_lat,
+                                        args.embed_year)
             if item is None:
-                n_fail += 1
-                continue
-            scene_date = None
+                return None, None
             try:
-                scene_date = str(item.properties.get("datetime", ""))[:10] or None
+                raw = acq_mod.extract_patch(item, r.cell_lon, r.cell_lat,
+                                            PATCH_SIZE_M, PATCH_SIZE_PX, PRITHVI_BANDS)
             except Exception:
-                pass
+                return None, None
             try:
-                raw = acq().extract_patch(item, r.cell_lon, r.cell_lat,
-                                          PATCH_SIZE_M, PATCH_SIZE_PX, PRITHVI_BANDS)
-                v = embed_cell(model, args.model, raw, r.cell_lon, r.cell_lat,
-                               scene_date, means, stds)
+                date = str(item.properties.get("datetime", ""))[:10] or None
             except Exception:
-                n_fail += 1
-                continue
-            v = v.astype(np.float32)
-            v /= np.linalg.norm(v) + 1e-8
-            cache[ckey(r.cell_lon, r.cell_lat)] = v
-            n_ok += 1
-            if n_ok % 25 == 0:
+                date = None
+            return raw, date
+
+        # Fetch in bounded chunks: pool.map over all of `todo` would queue every raw
+        # patch in memory (602 KB each -- 8 GB for a 13,300-cell run). A chunk also
+        # marks a natural save point, so an interrupted run resumes from the last one.
+        n_ok = n_fail = n_timeout = 0
+        CHUNK = max(1, args.workers * 4)
+        # Wall-clock budget for a whole chunk. The GDAL timeouts above should catch a dead
+        # socket, but they do not cover every way a read can stall (DNS, TLS handshake, a
+        # server holding the connection open). submit()+as_completed with a timeout is the
+        # backstop: whatever has not arrived is abandoned and the run moves on. The worker
+        # thread may leak, which is acceptable -- a leaked thread costs memory, a hung
+        # pool.map costs the entire job, as it did for 6 h 19 m.
+        CHUNK_TIMEOUT_S = 90 * CHUNK / max(1, args.workers)
+        with tqdm(total=len(todo), desc="embedding cells") as bar:
+            for start in range(0, len(todo), CHUNK):
+                batch = todo[start:start + CHUNK]
+                fetched = [(None, None)] * len(batch)
+                pool = ThreadPoolExecutor(max_workers=args.workers)
+                try:
+                    futs = {pool.submit(fetch, r): i for i, r in enumerate(batch)}
+                    from concurrent.futures import as_completed, TimeoutError as FTimeout
+                    try:
+                        for fu in as_completed(futs, timeout=CHUNK_TIMEOUT_S):
+                            try:
+                                fetched[futs[fu]] = fu.result()
+                            except Exception:
+                                pass
+                    except FTimeout:
+                        stalled = sum(1 for fu in futs if not fu.done())
+                        n_timeout += stalled
+                        print(f"\n  [Warn] {stalled} cell(s) exceeded "
+                              f"{CHUNK_TIMEOUT_S:.0f}s and were abandoned; continuing.")
+                finally:
+                    # do not wait on stalled threads -- that is the hang we are fixing
+                    pool.shutdown(wait=False, cancel_futures=True)
+                # embed serially: one torch model, shared, and the forward pass is 1% of
+                # the cost -- threading it would risk the model for no measurable gain
+                for r, (raw, scene_date) in zip(batch, fetched):
+                    if raw is None:
+                        n_fail += 1
+                        bar.update(1)
+                        continue
+                    try:
+                        v = embed_cell(model, args.model, raw, r.cell_lon, r.cell_lat,
+                                       scene_date, means, stds)
+                    except Exception:
+                        n_fail += 1
+                        bar.update(1)
+                        continue
+                    v = v.astype(np.float32)
+                    v /= np.linalg.norm(v) + 1e-8
+                    cache[ckey(r.cell_lon, r.cell_lat)] = v
+                    n_ok += 1
+                    bar.update(1)
                 np.savez_compressed(CACHE, **cache)
-        np.savez_compressed(CACHE, **cache)
-        print(f"embedded {n_ok}, failed {n_fail} (no cloud-free scene / read error)")
+        print(f"embedded {n_ok}, failed {n_fail} (no cloud-free scene / read error), "
+              f"timed out {n_timeout}")
+        # Record cells that could not be embedded so later runs skip them instead of
+        # re-attempting the same hopeless fetches every time. They failed for real reasons --
+        # persistent cloud, a scene with no usable bands -- and retrying them on every run is
+        # what turned a resumable job into one that spent its first hour going nowhere.
+        if n_fail or n_timeout:
+            failed_keys = [ckey(r.cell_lon, r.cell_lat) for r in todo
+                           if ckey(r.cell_lon, r.cell_lat) not in cache]
+            fpath = f"{RESULTS_DIR}/analog_cells_unembeddable_{args.model}.json"
+            prev = []
+            if os.path.exists(fpath):
+                try:
+                    prev = json.load(open(fpath, encoding="utf-8"))
+                except Exception:
+                    prev = []
+            merged = sorted(set(prev) | set(failed_keys))
+            json.dump(merged, open(fpath, "w", encoding="utf-8"), indent=1)
+            print(f"  {len(failed_keys)} unembeddable cell(s) recorded in "
+                  f"{os.path.basename(fpath)} ({len(merged)} total); future runs skip them")
 
     # ---- retrieve analogs + build features ----
     hist_cache = {}
@@ -516,7 +682,20 @@ def main():
         if not allowed.any():
             continue
 
-        sims = P[allowed] @ v
+        if args.random_analogs:
+            # RANDOM-ANALOG CONTROL. Identical pipeline, identical leakage guards, identical
+            # number of analogs and identical downstream features -- the ONLY difference is
+            # that similarity is replaced by noise, so the "analogs" are drawn at random from
+            # the allowed pool instead of being the most similar places.
+            #
+            # This is the control the whole project rests on. Without it, "drivers + 8 analog
+            # columns beats drivers alone" has an obvious rival explanation: eight extra
+            # columns of any kind give a gradient-boosted model more capacity to fit. If real
+            # analogs beat random ones, similarity is doing the work and the claim holds. If
+            # they tie, the +11.5% is an artifact of feature count, not of retrieval.
+            sims = _rand_ctrl.random(int(allowed.sum()))
+        else:
+            sims = P[allowed] @ v
         allowed_idx = np.where(allowed)[0]
 
         # ONE ANALOG PER LOCATION. The pool holds 10 overlapping sub-crops per
@@ -540,7 +719,6 @@ def main():
 
         a_hists = [hist(plons[j], plats[j]) for j in a_idx]
         cell_hist = hist(r.cell_lon, r.cell_lat)
-        jac = trajectory_jaccard(cell_hist, a_hists)
 
         # fragmentation: how much more/less fragmented is this cell than its analogs
         cell_ed = edge(r.cell_lon, r.cell_lat)
@@ -552,13 +730,22 @@ def main():
             s = summarise_analog_history(a_hists, y, RISK_HORIZON_YEARS)
             if s is None:
                 continue
+            # LEAK FIX (26 Sep). analog_trajectory_jaccard used to be computed ONCE here,
+            # outside this loop, from the FULL 2001-2023 loss-year sets, and then written
+            # identically for all 17 observation years. So the row for obs_year 2010 carried
+            # a feature that already knew about loss up to 2023 -- the model could read the
+            # future through it. summarise_analog_history was always correctly windowed
+            # (y <= obs_year for prior, obs_year < y <= obs_year+horizon for the target);
+            # this one column was not. Clip BOTH sides to <= y and recompute per year.
+            jac_y = trajectory_jaccard(_clip_hist(cell_hist, y),
+                                       [_clip_hist(h, y) for h in a_hists])
             rows.append({
                 "region_id": r.region_id,
                 "cell_lon": round(r.cell_lon, 5),
                 "cell_lat": round(r.cell_lat, 5),
                 "obs_year": y,
                 **s,
-                "analog_trajectory_jaccard": jac,
+                "analog_trajectory_jaccard": jac_y,
                 "analog_fragmentation_delta": frag_delta,
                 "cell_edge_density": cell_ed,
                 "analog_mean_similarity": float(np.mean(a_sims)),

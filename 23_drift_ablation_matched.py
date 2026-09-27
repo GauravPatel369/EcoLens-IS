@@ -78,6 +78,18 @@ def boot_ci(y, p, n=500, seed=0):
 def main():
     df = pd.read_csv(RISK_FEATURES_PATH)
     total_rows = len(df)
+    # embedding_drift is optional: 10_grid_tiling_labels only computes it behind
+    # --with-embedding-drift, because it costs two Sentinel-2 fetches per cell on top of
+    # everything else. The 50-region rebuild was run without it, so the column is absent.
+    # Exit cleanly and say so -- a missing OPTIONAL feature is not a pipeline failure, and
+    # raising KeyError here aborted every remaining step (24, 25, 27, 28, 29, 32, 30, 33).
+    if DRIFT not in df.columns:
+        print(f"'{DRIFT}' column not present in {RISK_FEATURES_PATH}.")
+        print("This ablation needs it; re-run 10_grid_tiling_labels.py with "
+              "--with-embedding-drift to produce it (two extra S2 fetches per cell).")
+        print("Skipping -- nothing to ablate.")
+        return
+
     sub = df[df[DRIFT].notna()].copy()
     n_cells = sub.groupby(["cell_lon", "cell_lat"]).ngroups
 

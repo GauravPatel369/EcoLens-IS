@@ -97,13 +97,54 @@ def reciprocal_rank(retrieved, relevant_set):
 
 
 def bootstrap_ci(data, n_bootstraps=1000, ci=95):
-    """Generate confidence intervals via bootstrapping."""
+    """Naive bootstrap over individual observations.
+
+    KEPT for callers whose observations really are independent. NOT correct for per-query
+    retrieval scores -- use cluster_bootstrap_ci for those, and see why there.
+    """
     if not data:
         return 0.0, 0.0
     data = np.array(data)
     # Generate bootstrap samples
     bootstraps = np.random.choice(data, size=(n_bootstraps, len(data)), replace=True)
     means = np.mean(bootstraps, axis=1)
+    lower = np.percentile(means, (100 - ci) / 2)
+    upper = np.percentile(means, 100 - (100 - ci) / 2)
+    return float(lower), float(upper)
+
+
+def cluster_bootstrap_ci(values, groups, n_bootstraps=1000, ci=95, seed=42):
+    """Bootstrap over CLUSTERS (base locations), not individual queries.
+
+    WHY THE OLD INTERVALS WERE TOO NARROW (fixed 26 Sep). There are 1,260 queries but only
+    126 locations: each location contributes 10 sub-crops that are overlapping 160 px
+    windows of the SAME 1.6 km patch. Those are near-duplicates, not independent draws, so
+    resampling the 1,260 per-query scores treats one location's ten highly-correlated
+    observations as ten independent ones. The effective sample size is ~126, and the naive
+    interval is therefore too tight by roughly sqrt(10) -- about 3x.
+
+    This matters for a claim the project actually makes: Clay's mAP interval was
+    [0.3045, 0.3277] against a spectral baseline of 0.2501. A correctly-widened interval
+    still clears the baseline, but by far less room than the old one suggested.
+
+    Resample the 126 LOCATIONS with replacement and take every query belonging to each one
+    drawn. This is the same grouping the evaluation itself already respects -- GROUPED
+    retrieval excludes same-base candidates -- so the bootstrap now matches the protocol.
+    """
+    if not values:
+        return 0.0, 0.0
+    by_group = {}
+    for v, g in zip(values, groups):
+        by_group.setdefault(g, []).append(v)
+    keys = list(by_group)
+    if len(keys) < 2:
+        return bootstrap_ci(values, n_bootstraps, ci)
+    rng = np.random.default_rng(seed)
+    means = np.empty(n_bootstraps, dtype=float)
+    idx = rng.integers(0, len(keys), size=(n_bootstraps, len(keys)))
+    for b in range(n_bootstraps):
+        pool = [x for i in idx[b] for x in by_group[keys[i]]]
+        means[b] = np.mean(pool)
     lower = np.percentile(means, (100 - ci) / 2)
     upper = np.percentile(means, 100 - (100 - ci) / 2)
     return float(lower), float(upper)
@@ -147,6 +188,8 @@ def evaluate_method(retrieval_results, catalog_lookup, method_name, k_values, gr
         ecosystem_patches.setdefault(eco, set()).add(pid)
 
     all_ap, all_rr = [], []
+    # the base location each score came from, so the CI can resample locations not crops
+    all_groups = []
     per_k_precision = {k: [] for k in k_values}
     per_k_recall = {k: [] for k in k_values}
 
@@ -187,6 +230,7 @@ def evaluate_method(retrieval_results, catalog_lookup, method_name, k_values, gr
         rr = reciprocal_rank(filtered_results, relevant_set)
         all_ap.append(ap)
         all_rr.append(rr)
+        all_groups.append(query_base)
         category_metrics[query_eco]["ap"].append(ap)
         category_metrics[query_eco]["rr"].append(rr)
 
@@ -203,8 +247,12 @@ def evaluate_method(retrieval_results, catalog_lookup, method_name, k_values, gr
         for item in filtered_results[:max_k]:
             confusion[query_eco][item["ecosystem"]] += 1
 
-    map_lower, map_upper = bootstrap_ci(all_ap) if all_ap else (0.0, 0.0)
-    mrr_lower, mrr_upper = bootstrap_ci(all_rr) if all_rr else (0.0, 0.0)
+    # cluster bootstrap: resample the ~126 base locations, not the ~1,260 sub-crop queries
+    map_lower, map_upper = cluster_bootstrap_ci(all_ap, all_groups) if all_ap else (0.0, 0.0)
+    mrr_lower, mrr_upper = cluster_bootstrap_ci(all_rr, all_groups) if all_rr else (0.0, 0.0)
+    if all_groups:
+        print(f"    CI basis: {len(set(all_groups))} locations clustered from "
+              f"{len(all_ap)} queries (cluster bootstrap)")
 
     overall = {
         "method": method_name,

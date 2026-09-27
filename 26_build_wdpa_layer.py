@@ -97,8 +97,26 @@ def main():
     import geopandas as gpd
     import pyogrio
 
+    # IDEMPOTENCE (added 26 Sep). This script deletes SRC_ZIP on success, calling it
+    # "regenerable" -- so on any second run the zip is gone and the old code raised
+    # SystemExit. Inside run_phase that is a hard failure, and because the runner aborts the
+    # whole sequence on a failed step it killed every downstream stage: tiling, the risk
+    # model, the analog ablation, all of it, over an input that was deliberately discarded
+    # after it had already done its job.
+    #
+    # If the output layer exists and the source is gone, there is nothing to do and nothing
+    # is wrong. Say so and exit cleanly. Only a MISSING output with a missing source is a
+    # real error.
     if not os.path.exists(SRC_ZIP):
-        raise SystemExit(f"{SRC_ZIP} not found -- download it first.")
+        if os.path.exists(OUT_GPKG):
+            size_gb = os.path.getsize(OUT_GPKG) / 1e9
+            print(f"WDPA layer already built: {OUT_GPKG} ({size_gb:.1f} GB)")
+            print(f"Source archive {os.path.basename(SRC_ZIP)} was removed after the original "
+                  f"build (it is a public static download). Nothing to rebuild -- exiting ok.")
+            return
+        raise SystemExit(
+            f"{SRC_ZIP} not found and {OUT_GPKG} does not exist either.\n"
+            f"Download the WDPA public shapefile archive to {GEO_DATA_DIR} and re-run.")
 
     # REALM <> 'Marine' keeps Terrestrial AND Coastal, which is the intent the old
     # MARINE <> '2' encoded: a partly-marine coastal reserve still protects land.
