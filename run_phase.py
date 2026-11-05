@@ -41,7 +41,8 @@ from datetime import datetime
 # same place the steps actually write.
 from config import (LOGS_DIR as LOG_DIR, RESULTS_DIR, METADATA_CATALOG_PATH,
                     PATCHES_DIR, PROCESSED_PATCHES_DIR, RISK_FEATURES_PATH,
-                    RISK_MODEL_DIR, DASHBOARDS_DIR, WDPA_POLYGONS_PATH)
+                    RISK_MODEL_DIR, DASHBOARDS_DIR, WDPA_POLYGONS_PATH,
+                    WORLDCLIM_TEMP_PATH, WORLDCLIM_PRECIP_PATH, ECOREGIONS_PATH)
 STATE_PATH = os.path.join(LOG_DIR, "pipeline_state.json")
 MODELS = ["prithvi", "vit", "resnet", "clay", "satlas"]
 
@@ -100,6 +101,14 @@ def enough(d):
 # A callable artifact is invoked and must return truthy.
 def build_steps():
     steps = [
+        # Reference data (WorldClim climate, DEM elevation, RESOLVE ecoregions) MUST exist before
+        # tiling. Fetching it here means a FRESH run sets itself up with no separate manual step --
+        # a run that skips this is exactly how temp_c/rainfall_mm end up mostly empty and the analog
+        # features look falsely significant. WorldClim/ecoregions/DEM use verified static URLs (no
+        # auth); WDPA is built later by step 26 (it needs a token, so --all excludes it). Skipped
+        # automatically once the files are present.
+        ("00_refdata", [PY, "download_reference_data.py", "--all"],
+         [WORLDCLIM_TEMP_PATH, WORLDCLIM_PRECIP_PATH, ECOREGIONS_PATH]),
         ("01_acquire", [PY, "01_acquire_patches.py"], [f"{PATCHES_DIR}/acquisition_manifest.json"]),
         ("00_validate", [PY, "00_validate_locations.py"], []),
         ("02_preprocess", [PY, "02_preprocess_patches.py"],
@@ -199,6 +208,11 @@ def build_steps():
          [WDPA_POLYGONS_PATH]),
         ("10_tiling", [PY, "10_grid_tiling_labels.py"],
          [RISK_FEATURES_PATH]),
+        # GUARD: stop the whole pipeline if the driver data is incomplete -- climate columns mostly
+        # empty (misnamed/missing WorldClim) or regions dropped (unreadable Hansen tiles). On broken
+        # drivers the analog features falsely compensate and produce a spurious "significant" gain,
+        # so NO risk/analog step may run until this passes. It exits non-zero and the runner stops.
+        ("10b_data_check", [PY, "check_data_completeness.py"], []),
         ("11_base", [PY, "11_forest_risk_forecast.py"], []),
         ("11_ablation", [PY, "11_forest_risk_forecast.py", "--ablation"], []),
         ("11_spatial", [PY, "11_forest_risk_forecast.py", "--spatial-holdout"], []),
@@ -206,22 +220,22 @@ def build_steps():
         # the bridge between the two pillars: 13 builds the analog features, 14 scores
         # them under both protocols. Prithvi is the primary backbone; Clay is the
         # independent-backbone replication, so both are needed.
-        # --cells-per-region 100 matches the sampling the published analog result was built
-        # with (the flag's default is 20). Keeping it explicit means expanding from 17 to 50
-        # regions changes ONE thing -- the number of regions -- instead of quietly also
-        # changing cells per region, which would make the before/after incomparable.
+        # --cells-per-region 20 (the flag's default) is the sampling every published analog
+        # number was actually built with: the stored analog_cell_features*.csv are ~15.8k
+        # rows (20 cells x ~50 regions), not the ~79k a 100-cell run produces. Kept explicit
+        # so a fresh run reproduces the report's Table 15 instead of a different-sized sample.
         ("13_analog_prithvi", [PY, "13_analog_risk_features.py", "--model", "prithvi",
-                               "--cells-per-region", "100"],
+                               "--cells-per-region", "20"],
          [f"{RESULTS_DIR}/analog_cell_features.csv"]),
         ("13_analog_clay", [PY, "13_analog_risk_features.py", "--model", "clay",
-                            "--cells-per-region", "100"],
+                            "--cells-per-region", "20"],
          [f"{RESULTS_DIR}/analog_cell_features_clay.csv"]),
         # THE CONTROL ARM. Reuses the cell embeddings the real run just cached, so it needs
         # no downloads -- only the similarity search is redone, with noise in place of
         # similarity. Without this arm, "8 analog columns beat 0" has an untested rival
         # explanation: any 8 extra columns give the model more capacity.
         ("13_analog_randctrl", [PY, "13_analog_risk_features.py", "--model", "prithvi",
-                               "--cells-per-region", "100", "--random-analogs"],
+                               "--cells-per-region", "20", "--random-analogs"],
          [f"{RESULTS_DIR}/analog_cell_features_randctrl.csv"]),
         ("14_ablation_temporal", [PY, "14_analog_ablation.py"],
          [f"{RISK_MODEL_DIR}/analog_ablation_temporal.json"]),
@@ -233,6 +247,27 @@ def build_steps():
         ("14_ablation_spatial_clay",
          [PY, "14_analog_ablation.py", "--spatial-holdout", "--model", "clay"],
          [f"{RISK_MODEL_DIR}/analog_ablation_spatial_clay.json"]),
+        # RANDOM-ANALOG CONTROL, SCORED AUTOMATICALLY. 13_analog_randctrl above built the prithvi
+        # random features; build the clay random features too, then score BOTH controls under both
+        # protocols. This is the decisive test: if random analogs match the real ones, the analog
+        # "gain" is just extra-column capacity, not similarity -- so the control is part of every
+        # run, never an optional afterthought. (14 --model randctrl reads analog_cell_features_
+        # randctrl.csv; --model clay_randctrl reads analog_cell_features_clay_randctrl.csv.)
+        ("13_analog_clay_randctrl",
+         [PY, "13_analog_risk_features.py", "--model", "clay", "--cells-per-region", "20",
+          "--random-analogs"],
+         [f"{RESULTS_DIR}/analog_cell_features_clay_randctrl.csv"]),
+        ("14_ablation_temporal_randctrl", [PY, "14_analog_ablation.py", "--model", "randctrl"],
+         [f"{RISK_MODEL_DIR}/analog_ablation_temporal_randctrl.json"]),
+        ("14_ablation_spatial_randctrl",
+         [PY, "14_analog_ablation.py", "--spatial-holdout", "--model", "randctrl"],
+         [f"{RISK_MODEL_DIR}/analog_ablation_spatial_randctrl.json"]),
+        ("14_ablation_temporal_clay_randctrl",
+         [PY, "14_analog_ablation.py", "--model", "clay_randctrl"],
+         [f"{RISK_MODEL_DIR}/analog_ablation_temporal_clay_randctrl.json"]),
+        ("14_ablation_spatial_clay_randctrl",
+         [PY, "14_analog_ablation.py", "--spatial-holdout", "--model", "clay_randctrl"],
+         [f"{RISK_MODEL_DIR}/analog_ablation_spatial_clay_randctrl.json"]),
         ("23_drift_ablation", [PY, "23_drift_ablation_matched.py"],
          [f"{RISK_MODEL_DIR}/drift_ablation_matched.json"]),
         ("24_succession", [PY, "24_successional_stages.py"],

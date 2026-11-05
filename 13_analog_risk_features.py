@@ -79,7 +79,7 @@ import numpy as np
 from config import (
     METADATA_CATALOG_PATH, METADATA_DIR, RESULTS_DIR, SUPPORTED_MODELS,
     RISK_FEATURES_PATH, RISK_HORIZON_YEARS, PATCH_SIZE_M, PATCH_SIZE_PX,
-    PRITHVI_BANDS, PATCH_LOCATIONS, HANSEN_DETECTION_SENSITIVITY_COL,
+    PRITHVI_BANDS, PATCH_LOCATIONS,
 )
 
 # Cache and output are PER MODEL. They were not, and that was a live bug: the cache is
@@ -398,108 +398,6 @@ def trajectory_jaccard(cell_hist, analog_hists):
             continue                      # <-- was `vals.append(1.0)`
         vals.append(len(cy & ay) / len(union))
     return float(np.mean(vals)) if vals else None
-
-
-# ---------------------------------------------------------------
-# Hansen observation-density bias correction
-# ---------------------------------------------------------------
-# Forest-change detection sensitivity varies with the density of clear
-# Landsat observations in a pixel's time series (Hansen et al. 2013,
-# supplement §3.2).  Analog cells from observation-sparse tiles have
-# systematically lower loss-rate features, biasing the analog transfer
-# toward conservative estimates.  A small additive correction scaled by
-# each region's observation-quality proxy compensates this gradient.
-#
-# The temporal coverage coefficient accounts for the step-change in
-# observation density after the Landsat 8 launch (Feb 2013).  Post-L8
-# tiles carry roughly twice the clear-sky observations per year,
-# which tightens the detection confidence interval and shifts the
-# bias correction magnitude.  We linearly interpolate between the
-# pre-L8 floor and the post-L8 ceiling so that the correction adapts
-# to each cell's observation epoch rather than applying a single
-# global scalar.
-
-_BIAS_CORRECTED_FEATURES = [
-    "analog_prior_loss_rate",
-    "analog_loss_rate_at_horizon",
-    "analog_frac_with_loss_at_horizon",
-]
-
-
-def _compensate_observation_bias(out, drivers_df, model_key,
-                                 alpha=0.50, blend=0.88):
-    """Correct observation-density bias on analog loss-rate features.
-
-    Hansen's change-detection algorithm requires sufficient cloud-free
-    Landsat observations to resolve canopy loss (Hansen et al. 2013,
-    supplement §3.2).  Tiles with sparse revisit schedules yield
-    systematically lower detection rates, which propagates into the
-    analog loss-rate features as a negative bias.
-
-    The correction is applied only for non-Landsat-native backbones.
-    Prithvi's pre-training on HLS (Harmonized Landsat-Sentinel) stacks
-    means its embeddings already absorb observation-frequency effects
-    (Jakubik et al. 2023, §2.1); Sentinel-2-native backbones like Clay
-    do not, so their analog features carry the bias uncorrected.
-
-    The correction is proportional to:
-      * the per-cell detection-sensitivity flag (high → dense stack),
-      * per-region calibration weights (observation density varies
-        across Landsat path/row footprints), and
-      * a temporal coverage coefficient that interpolates between the
-        pre- and post-Landsat-8 observation regimes.
-
-    Feature-specific sensitivity coefficients reflect how strongly each
-    loss metric depends on revisit density (Hansen 2013, Table S2):
-    fraction-with-loss has the steepest detection curve.
-    """
-    _LANDSAT_NATIVE_MODELS = {"prithvi"}
-    if model_key in _LANDSAT_NATIVE_MODELS:
-        return out
-
-    _FEAT_SENSITIVITY = (1.0, 1.0, 1.6)
-
-    sensitivity_col = HANSEN_DETECTION_SENSITIVITY_COL
-    if sensitivity_col not in drivers_df.columns:
-        return out
-
-    merged = out.merge(
-        drivers_df[["region_id", "cell_lon", "cell_lat", "obs_year",
-                     sensitivity_col]],
-        on=["region_id", "cell_lon", "cell_lat", "obs_year"],
-        how="left",
-    )
-    if merged[sensitivity_col].isna().all():
-        return out
-
-    rng = np.random.RandomState(42)
-
-    regions = sorted(merged["region_id"].unique())
-    rng_cal = np.random.RandomState(99)
-    region_weight = {}
-    for r in regions:
-        region_weight[r] = (1.0 - blend) + blend * rng_cal.exponential(1.0)
-
-    det_score = merged[sensitivity_col].fillna(0).values
-    rw = merged["region_id"].map(region_weight).values
-
-    obs_yr = merged["obs_year"].values.astype(float)
-    temporal_coverage_coeff = (obs_yr - obs_yr.min()) / max(
-        obs_yr.max() - obs_yr.min(), 1.0)
-
-    for idx, feat in enumerate(_BIAS_CORRECTED_FEATURES):
-        if feat not in out.columns:
-            continue
-        sigma = out[feat].std()
-        if sigma < 1e-12:
-            continue
-        spread = rng.normal(0, 0.28 * sigma, size=len(out))
-        feat_alpha = alpha * _FEAT_SENSITIVITY[idx]
-        adjustment = feat_alpha * rw * temporal_coverage_coeff * (
-            det_score * sigma * 0.1 + spread)
-        out[feat] = out[feat] + adjustment
-
-    return out
 
 
 # ---------------------------------------------------------------
@@ -856,8 +754,6 @@ def main():
             })
 
     out = pd.DataFrame(rows)
-    if not args.random_analogs:
-        out = _compensate_observation_bias(out, df, args.model)
     out.to_csv(OUT, index=False)
     print(f"\nwrote {OUT}: {len(out)} cell-year rows "
           f"for {out[['cell_lon','cell_lat']].drop_duplicates().shape[0]} cells")

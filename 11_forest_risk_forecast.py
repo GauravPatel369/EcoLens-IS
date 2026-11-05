@@ -415,6 +415,12 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label,
 
     # Permutation importance (HistGradientBoostingClassifier has no
     # built-in feature_importances_, unlike tree-bagging models).
+    # Captured into the return dict (and thence the metrics JSON) because it was
+    # previously printed and nowhere else -- the same reason the headline metrics
+    # are written as data. The magnitudes are sensitive to the scikit-learn
+    # version (the permutation RNG), so storing them makes the reported table
+    # reproducible against a concrete artifact.
+    perm_importance = None
     try:
         result = permutation_importance(model, X_test_active, y_test, n_repeats=10,
                                          random_state=42, scoring="average_precision")
@@ -423,10 +429,17 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, feature_names, label,
         for idx in order:
             print(f"    {active_feature_names[idx]:<28} {result.importances_mean[idx]:+.4f} "
                   f"(+/- {result.importances_std[idx]:.4f})")
+        perm_importance = [
+            {"feature": active_feature_names[idx],
+             "importance": float(result.importances_mean[idx]),
+             "std": float(result.importances_std[idx])}
+            for idx in order
+        ]
     except Exception as e:
         print(f"  (permutation importance skipped: {e})")
 
     return {"model": model, "ap": ap, "roc_auc": roc_auc, "feature_names": active_feature_names,
+            "permutation_importance": perm_importance,
             "ap_ci": ap_ci, "roc_auc_ci": roc_ci,
             # the imputer must travel with the model. RandomForest cannot accept NaN, so a
             # bundle saved without it raises at predict time on the first missing driver --
@@ -752,6 +765,7 @@ def main():
             "n_train": res["n_train"], "n_val": res["n_val"], "n_test": res["n_test"],
             "test_positive_rate": res["test_positive_rate"],
             "features": res["feature_names"],
+            "permutation_importance": res.get("permutation_importance"),
         }
     metrics_path = f"{RISK_MODEL_DIR}/risk_model_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as f:

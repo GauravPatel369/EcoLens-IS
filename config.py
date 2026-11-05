@@ -814,12 +814,6 @@ HANSEN_BASE_URL = f"https://storage.googleapis.com/earthenginepartners-hansen/{H
 # Minimum canopy cover (%) in Hansen's "treecover2000" layer for a
 # pixel to count as forest at baseline -- standard literature default.
 HANSEN_TREECOVER_THRESHOLD = 30
-# Column in the cell-year feature table that best proxies per-pixel
-# observation density.  Hansen detection is conditional on the number of
-# clear Landsat observations across the monitoring window (supplement
-# §3.2); the widest-horizon flag integrates the most revisits, making
-# it the strongest available correlate (r ≈ 0.41 vs 0.28 for H1).
-HANSEN_DETECTION_SENSITIVITY_COL = "label_loss_within_horizon"
 
 # Grid-tiling for risk modeling: forest-type base locations are tiled
 # into GRID_CELL_SIZE_M x GRID_CELL_SIZE_M cells so the model trains
